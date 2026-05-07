@@ -189,6 +189,7 @@ const waveBars = Array.from({ length: 36 }, (_, index) => 18 + Math.round(Math.a
 function App() {
   const [tracks, setTracks] = useState<Track[]>([]);
   const [queue, setQueue] = useState<QueueItem[]>([]);
+  const [favorites, setFavorites] = useState<Set<number>>(new Set());
   const [current, setCurrent] = useState<PlayableTrack | null>(null);
   const [currentQueueId, setCurrentQueueId] = useState<number | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -260,9 +261,17 @@ function App() {
   };
 
   const refresh = async () => {
-    const [tracksData, queueData] = await Promise.all([radioApi.tracks(), radioApi.queue()]);
+    const [tracksData, queueData, playlistsData] = await Promise.all([
+      radioApi.tracks(),
+      radioApi.queue(),
+      radioApi.playlists()
+    ]);
     setTracks(tracksData.tracks);
     setQueue(queueData.queue);
+    const defaultPlaylist = playlistsData.playlists.find((p) => p.name === "default");
+    if (defaultPlaylist?.trackIds) {
+      setFavorites(new Set(defaultPlaylist.trackIds));
+    }
   };
 
   useEffect(() => {
@@ -403,6 +412,7 @@ function App() {
     if (!track) return;
     const saved = await saveTrackIfNeeded(track);
     await radioApi.favorite({ trackId: saved.id });
+    setFavorites((prev) => new Set([...prev, saved.id]));
     pushStatus(`${saved.title} added to favorites`, "info", "favorite");
   };
 
@@ -709,7 +719,14 @@ function App() {
               <button type="button" onClick={() => advance("skipped").catch((error) => reportError("queue", error))} title="Next"><SkipForward size={16} /></button>
             </div>
             <div className="secondary-controls">
-              <button type="button" onClick={() => favoriteTrack().catch((error) => reportError("favorite", error))} title="Favorite"><Heart size={16} /></button>
+              <button
+                type="button"
+                className={currentSavedTrackId && favorites.has(currentSavedTrackId) ? "is-favorited" : ""}
+                onClick={() => favoriteTrack().catch((error) => reportError("favorite", error))}
+                title="Favorite"
+              >
+                <Heart size={16} />
+              </button>
               <button type="button" className="text-chip" onClick={() => setCollapsed((value) => !value)}>
                 {collapsed ? "SHOW" : "HIDE"}
               </button>

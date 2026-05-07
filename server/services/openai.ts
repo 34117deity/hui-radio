@@ -310,7 +310,7 @@ function sanitizeMemorySummary(text: string) {
 function shouldRefreshMemory(pendingCount: number, lastSummaryAt?: string) {
   if (pendingCount >= SUMMARY_BATCH_SIZE) return true;
   if (!pendingCount) return false;
-  if (!lastSummaryAt) return true;
+  if (!lastSummaryAt) return false;
   const elapsed = Date.now() - new Date(lastSummaryAt).getTime();
   return Number.isFinite(elapsed) && elapsed >= SUMMARY_MIN_INTERVAL_MS;
 }
