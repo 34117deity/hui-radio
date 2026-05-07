@@ -229,6 +229,7 @@ function App() {
   const currentTitle = current?.title || "No song selected";
   const currentArtist = current?.artist || current?.source || "Hui Radio";
   const currentSavedTrackId = isSavedTrack(current) ? current.id : null;
+  const currentIsFavorited = currentSavedTrackId !== null && favorites.has(currentSavedTrackId);
   const currentMotionKey = `${currentTitle}-${currentArtist}-${currentSavedTrackId || "external"}`;
 
   const aiContext: AiContext = useMemo(
@@ -421,9 +422,11 @@ function App() {
 
   const favoriteTrack = async (track: PlayableTrack | null = current) => {
     if (!track) return;
+    const isCurrentTrack = track === current;
     const saved = await saveTrackIfNeeded(track);
     await radioApi.favorite({ trackId: saved.id });
     setFavorites((prev) => new Set([...prev, saved.id]));
+    if (isCurrentTrack) setCurrent(saved);
     recordUserPreference(saved, "favorite");
     await refresh();
     pushStatus(`${saved.title} added to favorites`, "info", "favorite");
@@ -655,8 +658,9 @@ function App() {
             <div className="secondary-controls">
               <button
                 type="button"
-                className={currentSavedTrackId && favorites.has(currentSavedTrackId) ? "is-favorited" : ""}
+                className={currentIsFavorited ? "is-favorited" : ""}
                 onClick={() => favoriteTrack().catch((error) => reportError("favorite", error))}
+                aria-pressed={currentIsFavorited}
                 title="Favorite"
               >
                 <Heart size={16} />

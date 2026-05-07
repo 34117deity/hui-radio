@@ -575,11 +575,13 @@ textarea {
   color: #ff4757;
   background: color-mix(in srgb, #ff4757 12%, var(--surface));
   border-color: color-mix(in srgb, #ff4757 30%, var(--hairline));
+  box-shadow: 0 0 0 1px color-mix(in srgb, #ff4757 18%, transparent), 0 6px 18px color-mix(in srgb, #ff4757 18%, transparent);
 }
 
 .transport-buttons button.is-favorited svg,
 .candidate-card button.is-favorited svg {
   fill: #ff4757;
+  stroke: #ff4757;
 }
 
 .transport-buttons .round-primary,
