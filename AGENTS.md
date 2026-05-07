@@ -9,4 +9,4 @@ Only the auto memory section is rewritten by the app. You can edit Manual Notes 
 <!-- AUTO_MEMORY_END -->
 
 ## Manual Notes
-- Add any hand-written permanent notes here.
+- keep me

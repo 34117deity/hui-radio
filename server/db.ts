@@ -26,6 +26,12 @@ CREATE TABLE IF NOT EXISTS tracks (
   title TEXT NOT NULL,
   artist TEXT,
   album TEXT,
+  language TEXT,
+  genre TEXT,
+  mood TEXT,
+  scene TEXT,
+  tempo TEXT,
+  energy INTEGER,
   source TEXT NOT NULL DEFAULT 'url',
   source_id TEXT,
   songmid TEXT,
@@ -94,9 +100,19 @@ ON tracks (
 `);
 
 const trackColumns = db.prepare("PRAGMA table_info(tracks)").all() as Array<{ name: string }>;
-if (!trackColumns.some((column) => column.name === "removed_at")) {
-  db.prepare("ALTER TABLE tracks ADD COLUMN removed_at TEXT").run();
-}
+const ensureTrackColumn = (name: string, definition: string) => {
+  if (!trackColumns.some((column) => column.name === name)) {
+    db.prepare(`ALTER TABLE tracks ADD COLUMN ${name} ${definition}`).run();
+  }
+};
+
+ensureTrackColumn("language", "TEXT");
+ensureTrackColumn("genre", "TEXT");
+ensureTrackColumn("mood", "TEXT");
+ensureTrackColumn("scene", "TEXT");
+ensureTrackColumn("tempo", "TEXT");
+ensureTrackColumn("energy", "INTEGER");
+ensureTrackColumn("removed_at", "TEXT");
 
 const aiMessageColumns = db.prepare("PRAGMA table_info(ai_messages)").all() as Array<{ name: string }>;
 if (!aiMessageColumns.some((column) => column.name === "session_id")) {
@@ -133,6 +149,12 @@ const trackRow = (row: Record<string, unknown>): Track => ({
   title: String(row.title),
   artist: row.artist ? String(row.artist) : undefined,
   album: row.album ? String(row.album) : undefined,
+  language: row.language ? String(row.language) : undefined,
+  genre: row.genre ? String(row.genre) : undefined,
+  mood: row.mood ? String(row.mood) : undefined,
+  scene: row.scene ? String(row.scene) : undefined,
+  tempo: row.tempo ? String(row.tempo) : undefined,
+  energy: row.energy ? Number(row.energy) : undefined,
   source: row.source ? String(row.source) : "url",
   sourceId: row.source_id ? String(row.source_id) : undefined,
   songmid: row.songmid ? String(row.songmid) : undefined,
@@ -161,14 +183,20 @@ export function upsertPlaylist(name: string, source: string, externalId = ""): P
 export function upsertTrack(input: TrackInput): Track {
   const insert = db.prepare(
     `INSERT OR IGNORE INTO tracks
-      (title, artist, album, source, source_id, songmid, hash, interval, duration, artwork, lyric, direct_url, raw_json)
+      (title, artist, album, language, genre, mood, scene, tempo, energy, source, source_id, songmid, hash, interval, duration, artwork, lyric, direct_url, raw_json)
      VALUES
-      (@title, @artist, @album, @source, @sourceId, @songmid, @hash, @interval, @duration, @artwork, @lyric, @directUrl, @rawJson)`
+      (@title, @artist, @album, @language, @genre, @mood, @scene, @tempo, @energy, @source, @sourceId, @songmid, @hash, @interval, @duration, @artwork, @lyric, @directUrl, @rawJson)`
   );
   const params = {
     title: input.title.trim(),
     artist: input.artist?.trim() || null,
     album: input.album?.trim() || null,
+    language: input.language?.trim() || null,
+    genre: input.genre?.trim() || null,
+    mood: input.mood?.trim() || null,
+    scene: input.scene?.trim() || null,
+    tempo: input.tempo?.trim() || null,
+    energy: input.energy || null,
     source: input.source || "url",
     sourceId: input.sourceId || null,
     songmid: input.songmid || null,

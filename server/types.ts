@@ -4,6 +4,12 @@ export interface TrackInput {
   title: string;
   artist?: string;
   album?: string;
+  language?: string;
+  genre?: string;
+  mood?: string;
+  scene?: string;
+  tempo?: string;
+  energy?: number;
   source?: MusicSource;
   sourceId?: string;
   songmid?: string;

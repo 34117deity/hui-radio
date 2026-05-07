@@ -6,15 +6,12 @@ import { z } from "zod";
 import {
   addTrackToPlaylist,
   attachTrackToPlaylist,
-  enqueueTracks,
   getDefaultFavoritesPlaylist,
   listRecentAiMessages,
   getPlaylist,
   getTrack,
   listPlaylists,
-  listQueue,
   listTracks,
-  markQueueItem,
   removeTrack,
   upsertPlaylist,
   upsertTrack
@@ -23,6 +20,7 @@ import { importQqPlaylist, searchQqSongs } from "./importers/qq.js";
 import { parseLxImport } from "./importers/lx.js";
 import { askAi, createWelcome, synthesizeSpeech } from "./services/openai.js";
 import { getLxSourceHealth, loadLxSource, resolveLxMusicUrl } from "./services/lxSource.js";
+import type { Track, TrackInput } from "./types.js";
 
 export const api = express.Router();
 const externalPlaybackCache = new NodeCache({ stdTTL: 60 * 15, checkperiod: 60 });
@@ -31,6 +29,12 @@ const trackInputSchema = z.object({
   title: z.string().min(1),
   artist: z.string().optional(),
   album: z.string().optional(),
+  language: z.string().optional(),
+  genre: z.string().optional(),
+  mood: z.string().optional(),
+  scene: z.string().optional(),
+  tempo: z.string().optional(),
+  energy: z.number().int().min(1).max(10).optional(),
   source: z.string().optional(),
   sourceId: z.string().optional(),
   songmid: z.string().optional(),
@@ -42,6 +46,23 @@ const trackInputSchema = z.object({
   raw: z.unknown().optional(),
   directUrl: z.string().optional()
 });
+
+function normalizeSongIdentity(value?: string) {
+  return (value || "").toLowerCase().replace(/[\u3001\u3002\u300a\u300b\u300c\u300d\u300e\u300f\u201c\u201d\u2018\u2019"'`()[\]\uff08\uff09\s]/g, "");
+}
+
+function isAlreadyInLibrary(candidate: TrackInput, library: Track[]) {
+  if (candidate.songmid && library.some((track) => track.songmid === candidate.songmid)) return true;
+  if (candidate.sourceId && candidate.source && library.some((track) => track.source === candidate.source && track.sourceId === candidate.sourceId)) return true;
+  const title = normalizeSongIdentity(candidate.title);
+  const artist = normalizeSongIdentity(candidate.artist);
+  return library.some((track) => normalizeSongIdentity(track.title) === title && normalizeSongIdentity(track.artist) === artist);
+}
+
+function filterLibraryCandidates(candidates: TrackInput[]) {
+  const library = listTracks(500);
+  return candidates.filter((candidate) => !isAlreadyInLibrary(candidate, library));
+}
 
 async function proxyAudio(url: string, req: express.Request, res: express.Response) {
   const upstream = await fetch(url, {
@@ -96,18 +117,6 @@ api.get("/health", async (_req, res) => {
 
 api.get("/playlists", (_req, res) => res.json({ playlists: listPlaylists() }));
 api.get("/tracks", (_req, res) => res.json({ tracks: listTracks() }));
-api.get("/queue", (_req, res) => res.json({ queue: listQueue() }));
-
-api.post("/queue", (req, res) => {
-  const body = z.object({ trackIds: z.array(z.number().int().positive()).min(1) }).parse(req.body);
-  res.json({ queue: enqueueTracks(body.trackIds) });
-});
-
-api.patch("/queue/:id", (req, res) => {
-  const params = z.object({ id: z.coerce.number().int().positive() }).parse(req.params);
-  const body = z.object({ status: z.enum(["played", "skipped"]) }).parse(req.body);
-  res.json({ queue: markQueueItem(params.id, body.status) });
-});
 
 api.post("/tracks", (req, res) => {
   const body = trackInputSchema.parse(req.body);
@@ -251,19 +260,18 @@ api.post("/ai/chat", async (req, res, next) => {
       context: body.context,
       allowExternal: body.allowExternal
     });
-    if (action.queueTrackIds?.length) enqueueTracks(action.queueTrackIds);
 
     let externalCandidates: Awaited<ReturnType<typeof searchQqSongs>> = [];
     let externalSearchError: string | undefined;
     if (body.allowExternal && action.externalSearchQuery) {
       try {
-        externalCandidates = await searchQqSongs(action.externalSearchQuery, 4);
+        externalCandidates = filterLibraryCandidates(await searchQqSongs(action.externalSearchQuery, 8)).slice(0, 4);
       } catch (error) {
         externalSearchError = error instanceof Error ? error.message : String(error);
       }
     }
 
-    res.json({ action, queue: listQueue(), externalCandidates, externalSearchError });
+    res.json({ action, externalCandidates, externalSearchError });
   } catch (error) {
     next(error);
   }

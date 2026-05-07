@@ -2,6 +2,12 @@ export interface TrackInput {
   title: string;
   artist?: string;
   album?: string;
+  language?: string;
+  genre?: string;
+  mood?: string;
+  scene?: string;
+  tempo?: string;
+  energy?: number;
   source?: string;
   sourceId?: string;
   songmid?: string;
@@ -30,15 +36,6 @@ export interface Playlist {
   createdAt: string;
 }
 
-export interface QueueItem {
-  id: number;
-  trackId: number;
-  position: number;
-  status: "queued" | "played" | "skipped";
-  createdAt: string;
-  track: Track;
-}
-
 export interface AiContext {
   city?: string;
   weather?: string;
@@ -51,7 +48,6 @@ export interface AiAction {
   say: string;
   playTrackId?: number | null;
   reason?: string;
-  queueTrackIds?: number[];
   externalSearchQuery?: string | null;
 }
 

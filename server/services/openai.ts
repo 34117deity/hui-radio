@@ -5,7 +5,7 @@ import OpenAI from "openai";
 import { ProxyAgent, fetch as undiciFetch } from "undici";
 import { z } from "zod";
 import { config } from "../config.js";
-import { getAiMemoryState, listAiMessagesSince, listQueue, listRecentAiMessages, listTracks, saveAiMessage, updateAiMemoryState } from "../db.js";
+import { getAiMemoryState, listAiMessagesSince, listRecentAiMessages, listTracks, saveAiMessage, updateAiMemoryState } from "../db.js";
 import { DEFAULT_AUTO_MEMORY, ensureAgentsMemoryFile, readAutoMemory, writeAutoMemory } from "./memory.js";
 import type { AiMessage, Track } from "../types.js";
 
@@ -149,7 +149,6 @@ export const aiActionSchema = z.object({
   say: z.string(),
   playTrackId: z.number().int().nullable().optional(),
   reason: z.string().optional(),
-  queueTrackIds: z.array(z.number().int()).optional(),
   externalSearchQuery: z.string().nullable().optional()
 });
 
@@ -157,9 +156,10 @@ export type AiAction = z.infer<typeof aiActionSchema>;
 
 const radioSystemPrompt = [
   "\u4f60\u662f Hui Radio \u7684\u4e2d\u6587 AI \u7535\u53f0\u4e3b\u64ad\uff0c\u50cf\u771f\u4eba DJ \u4e00\u6837\u81ea\u7136\u8bf4\u8bdd\uff0c\u77ed\u53e5\u3001\u6e29\u67d4\u3001\u6709\u753b\u9762\u611f\u3002",
-  "\u4f18\u5148\u4ece provided library \u548c queue \u91cc\u9009\u6b4c\uff0c\u53ea\u80fd\u4f7f\u7528\u4e0a\u4e0b\u6587\u4e2d\u771f\u5b9e\u5b58\u5728\u7684 track id\u3002",
-  "\u5982\u679c allowExternal \u4e3a true\uff0c\u4e14\u4f60\u60f3\u63a8\u8350\u66f2\u5e93\u5916\u6b4c\u66f2\uff0c\u8bf7\u628a externalSearchQuery \u5199\u6210\u660e\u786e\u7684\u201c\u6b4c\u540d \u827a\u4eba\u201d\u641c\u7d22\u8bcd\uff0c\u4e0d\u8981\u7ed9\u66f2\u5e93\u5916\u6b4c\u66f2\u7f16\u9020 id\u3002",
-  '\u53ea\u8fd4\u56de\u4e25\u683c JSON\uff1a{"say":"\u4e3b\u64ad\u53e3\u64ad\uff0c\u4e2d\u6587\uff0c80\u5b57\u4ee5\u5185","playTrackId":number|null,"reason":"optional","queueTrackIds":[number],"externalSearchQuery":string|null}\u3002',
+  "\u53ef\u4ee5\u4ece provided library \u91cc\u9009\u6b4c\uff0c\u53ea\u80fd\u4f7f\u7528\u4e0a\u4e0b\u6587\u4e2d\u771f\u5b9e\u5b58\u5728\u7684 track id\u3002",
+  "\u5982\u679c allowExternal \u4e3a true\uff0c\u4e14\u7528\u6237\u8bf4\u201c\u63a8\u8350\u201d\u3001\u201c\u6765\u4e00\u9996\u201d\u3001\u201c\u60f3\u542c\u65b0\u7684\u201d\u3001\u201c\u6ca1\u542c\u8fc7\u7684\u201d\uff0c\u4f18\u5148\u63a8\u8350\u66f2\u5e93\u5916\u6b4c\u66f2\uff1aplayTrackId \u8bbe\u4e3a null\uff0cexternalSearchQuery \u5199\u6210\u660e\u786e\u7684\u201c\u6b4c\u540d \u827a\u4eba\u201d\u641c\u7d22\u8bcd\u3002",
+  "\u53ea\u6709\u7528\u6237\u660e\u786e\u8bf4\u8981\u64ad\u653e\u672c\u5730\u3001\u6536\u85cf\u3001\u66f2\u5e93\u91cc\u7684\u6b4c\u65f6\uff0c\u624d\u4ece provided library \u9009\u6b4c\u3002\u4e0d\u8981\u7ed9\u66f2\u5e93\u5916\u6b4c\u66f2\u7f16\u9020 id\u3002",
+  '\u53ea\u8fd4\u56de\u4e25\u683c JSON\uff1a{"say":"\u4e3b\u64ad\u53e3\u64ad\uff0c\u4e2d\u6587\uff0c80\u5b57\u4ee5\u5185","playTrackId":number|null,"reason":"optional","externalSearchQuery":string|null}\u3002',
   "\u4e0d\u8981\u8f93\u51fa Markdown\uff0c\u4e0d\u8981\u89e3\u91ca JSON\u3002"
 ].join("\n");
 
@@ -196,7 +196,25 @@ function extractSongRequest(message: string) {
   return { title, artist: artist.trim() };
 }
 
-function localFallbackV2(message: string, allowExternal = false): AiAction {
+function wantsExternalRecommendation(message: string) {
+  return /推荐|推薦|来一首|來一首|想听|想聽|找一首|没听过|沒聽過|新歌|陌生|随便|隨便|换一首|換一首|歌/i.test(message);
+}
+
+function wantsLibraryRecommendation(message: string) {
+  return /曲库|曲庫|本地|收藏|我喜欢|我喜歡|库里|庫里|已有/i.test(message);
+}
+
+function buildExternalSearchQuery(message: string, requested: ReturnType<typeof extractSongRequest>, context?: AiRequestContext) {
+  if (requested.title) return `${requested.title}${requested.artist ? ` ${requested.artist}` : ""}`;
+  const hints = [context?.mood, context?.weather, context?.timeSlot, context?.city]
+    .filter((value): value is string => Boolean(value?.trim()))
+    .slice(0, 3);
+  const cleaned = message.replace(/[，。！？,.!?]/g, " ").replace(/\s+/g, " ").trim();
+  const requestHint = cleaned && !/^推荐|推薦|来一首|來一首|放歌|歌$/i.test(cleaned) ? cleaned.slice(0, 40) : "";
+  return [...hints, requestHint || "华语 流行 治愈"].join(" ");
+}
+
+function localFallbackV2(message: string, allowExternal = false, context?: AiRequestContext): AiAction {
   const tracks = listTracks(20);
   const requested = extractSongRequest(message);
   const reqTitle = normalize(requested.title);
@@ -219,17 +237,15 @@ function localFallbackV2(message: string, allowExternal = false): AiAction {
       })
       .sort((a, b) => b.score - a.score)[0];
 
-  const picked = bestRequested && bestRequested.score >= 95 ? bestRequested.track : tracks[0];
-  const externalSearchQuery =
-    allowExternal && requested.title
-      ? `${requested.title}${requested.artist ? ` ${requested.artist}` : ""}`
-      : allowExternal && !picked
-        ? message.slice(0, 80)
-        : undefined;
+  const shouldUseExternal = allowExternal && wantsExternalRecommendation(message) && !wantsLibraryRecommendation(message);
+  const picked = shouldUseExternal ? null : bestRequested && bestRequested.score >= 95 ? bestRequested.track : tracks[0];
+  const externalSearchQuery = allowExternal && (shouldUseExternal || requested.title || !picked) ? buildExternalSearchQuery(message, requested, context) : undefined;
 
   return {
-    say: picked
-      ? `\u6211\u5148\u7ed9\u4f60\u653e ${picked.title}${picked.artist ? ` - ${picked.artist}` : ""}\u3002\u5982\u679c\u4e91\u7aef AI \u6682\u65f6\u4e0d\u53ef\u7528\uff0c\u6211\u4f1a\u5148\u7528\u672c\u5730\u89c4\u5219\u7ee7\u7eed\u966a\u4f60\u542c\u3002`
+    say: externalSearchQuery && shouldUseExternal
+      ? `\u6211\u7ed9\u4f60\u5f80\u66f2\u5e93\u5916\u627e\u4e00\u9996\uff1a${externalSearchQuery}\u3002\u5019\u9009\u5361\u7247\u51fa\u6765\u540e\uff0c\u4f60\u53ef\u4ee5\u76f4\u63a5\u70b9\u64ad\u653e\u8bd5\u542c\u3002`
+      : picked
+      ? `\u6211\u5148\u63a8\u8350 ${picked.title}${picked.artist ? ` - ${picked.artist}` : ""}\u3002\u5982\u679c\u4e91\u7aef AI \u6682\u65f6\u4e0d\u53ef\u7528\uff0c\u6211\u4f1a\u5148\u7528\u672c\u5730\u89c4\u5219\u7ee7\u7eed\u966a\u4f60\u542c\u3002`
       : `\u6211\u542c\u5230\u4e86\uff1a${message}\u3002\u5148\u5bfc\u5165\u4e00\u4e9b\u6b4c\u66f2\uff0c\u6216\u8005\u8ba9\u6211\u53bb\u66f2\u5e93\u5916\u627e\u4e00\u9996\u9002\u5408\u6b64\u523b\u7684\u6b4c\u3002`,
     playTrackId: picked ? picked.id : null,
     externalSearchQuery,
@@ -471,7 +487,7 @@ export async function askAi(
   const history = toChatMessageParams(recentMessages);
 
   if (!client) {
-    const fallback = localFallbackV2(message, options?.allowExternal);
+    const fallback = localFallbackV2(message, options?.allowExternal, options?.context);
     saveAiMessage(sessionId, "assistant", fallback.say);
     void refreshGlobalMemoryFromMessages().catch(() => undefined);
     return fallback;
@@ -479,7 +495,6 @@ export async function askAi(
 
   const context = {
     tracks: listTracks(12).map((track) => ({ id: track.id, title: track.title, artist: track.artist, source: track.source })),
-    queue: listQueue().slice(0, 6).map((item) => ({ id: item.track.id, title: item.track.title, artist: item.track.artist })),
     recentConversation: recentMessages.map((entry) => ({ role: entry.role, content: entry.content })),
     listener: options?.context || {},
     allowExternal: Boolean(options?.allowExternal)
@@ -509,7 +524,7 @@ export async function askAi(
     }
     throw lastError;
   } catch (error) {
-    const fallback = localFallbackV2(message, options?.allowExternal);
+    const fallback = localFallbackV2(message, options?.allowExternal, options?.context);
     fallback.reason = `openai-fallback: ${error instanceof Error ? error.message : String(error)}`;
     saveAiMessage(sessionId, "assistant", fallback.say);
     void refreshGlobalMemoryFromMessages().catch(() => undefined);

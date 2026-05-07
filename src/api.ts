@@ -1,4 +1,4 @@
-import type { AiAction, AiContext, Playlist, QueueItem, Track, TrackInput } from "./types";
+import type { AiAction, AiContext, Playlist, Track, TrackInput } from "./types";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, init);
@@ -10,19 +10,6 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const radioApi = {
   tracks: () => request<{ tracks: Track[] }>("/api/tracks"),
   playlists: () => request<{ playlists: Playlist[] }>("/api/playlists"),
-  queue: () => request<{ queue: QueueItem[] }>("/api/queue"),
-  enqueue: (trackIds: number[]) =>
-    request<{ queue: QueueItem[] }>("/api/queue", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ trackIds })
-    }),
-  markQueue: (queueId: number, status: "played" | "skipped") =>
-    request<{ queue: QueueItem[] }>(`/api/queue/${queueId}`, {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ status })
-    }),
   resolve: (payload: { trackId?: number; track?: TrackInput; quality?: string }) =>
     request<{ url: string; playbackUrl?: string; cached: boolean; sourceReady: boolean }>("/api/music/resolve", {
       method: "POST",
@@ -42,7 +29,7 @@ export const radioApi = {
       body: JSON.stringify(track)
     }),
   removeTrack: (trackId: number) =>
-    request<{ trackId: number; queue: QueueItem[] }>(`/api/tracks/${trackId}`, {
+    request<{ trackId: number }>(`/api/tracks/${trackId}`, {
       method: "DELETE"
     }),
   favorite: (payload: { trackId?: number; track?: TrackInput }) =>
@@ -52,7 +39,7 @@ export const radioApi = {
       body: JSON.stringify(payload)
     }),
   askAi: (message: string, context: AiContext, allowExternal = true) =>
-    request<{ action: AiAction; queue: QueueItem[]; externalCandidates: TrackInput[]; externalSearchError?: string }>("/api/ai/chat", {
+    request<{ action: AiAction; externalCandidates: TrackInput[]; externalSearchError?: string }>("/api/ai/chat", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ message, context, allowExternal })

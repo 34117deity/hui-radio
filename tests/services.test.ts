@@ -4,12 +4,10 @@ import { config } from "../server/config.js";
 import {
   addTrackToPlaylist,
   db,
-  enqueueTracks,
   getAiMemoryState,
   getDefaultFavoritesPlaylist,
-  listQueue,
+  getTrack,
   listRecentAiMessages,
-  markQueueItem,
   upsertTrack
 } from "../server/db.js";
 import { askAi, aiActionSchema, refreshGlobalMemoryFromMessages, setOpenAiClientForTests, ttsCachePath } from "../server/services/openai.js";
@@ -77,7 +75,6 @@ describe("askAi", () => {
                     content: JSON.stringify({
                       say: "这首很适合现在。",
                       playTrackId: 7,
-                      queueTrackIds: [7],
                       externalSearchQuery: null
                     })
                   }
@@ -99,7 +96,7 @@ describe("askAi", () => {
       context: { city: "深圳", weather: "下雨", mood: "有点累", timeSlot: "晚上" }
     });
 
-    expect(result).toMatchObject({ say: "这首很适合现在。", playTrackId: 7, queueTrackIds: [7], externalSearchQuery: null });
+    expect(result).toMatchObject({ say: "这首很适合现在。", playTrackId: 7, externalSearchQuery: null });
     expect(capturedBodies[0]?.messages.some((entry) => typeof entry.content === "string" && entry.content.includes(`"recentConversation"`))).toBe(
       true
     );
@@ -134,12 +131,25 @@ describe("askAi", () => {
     expect(result.reason).toContain("timed out after 50ms");
   });
 
+  it("prefers external candidates for generic recommendation fallback when allowed", async () => {
+    upsertTrack({ title: "Library Song", artist: "Known Artist", source: "test" });
+
+    const result = await askAi("推荐一首我没听过的安静中文歌", {
+      allowExternal: true,
+      context: { mood: "安静", timeSlot: "深夜" }
+    });
+
+    expect(result.playTrackId).toBeNull();
+    expect(result.externalSearchQuery).toContain("安静");
+    expect(result.say).toContain("曲库外");
+  });
+
   it("stores and isolates recent messages by session id", async () => {
     setOpenAiClientForTests({
       chat: {
         completions: {
           create: async () => ({
-            choices: [{ message: { content: JSON.stringify({ say: "ok", playTrackId: null, queueTrackIds: [], externalSearchQuery: null }) } }]
+            choices: [{ message: { content: JSON.stringify({ say: "ok", playTrackId: null, externalSearchQuery: null }) } }]
           })
         }
       },
@@ -203,17 +213,30 @@ describe("global memory summary", () => {
   });
 });
 
-describe("queue and favorites", () => {
-  it("marks the current queue item and exposes the next queued track", () => {
-    const first = upsertTrack({ title: "First", artist: "DJ", source: "test" });
-    const second = upsertTrack({ title: "Second", artist: "DJ", source: "test" });
-    enqueueTracks([first.id, second.id]);
+describe("library and favorites", () => {
+  it("persists listener preference track tags", () => {
+    const track = upsertTrack({
+      title: "Tagged Song",
+      artist: "Hui",
+      language: "Mandarin",
+      genre: "dream pop",
+      mood: "calm",
+      scene: "late night",
+      tempo: "slow",
+      energy: 4,
+      source: "test"
+    });
 
-    const [current] = listQueue();
-    const queue = markQueueItem(current.id, "played");
-
-    expect(queue).toHaveLength(1);
-    expect(queue[0].track.title).toBe("Second");
+    expect(getTrack(track.id)).toMatchObject({
+      title: "Tagged Song",
+      artist: "Hui",
+      language: "Mandarin",
+      genre: "dream pop",
+      mood: "calm",
+      scene: "late night",
+      tempo: "slow",
+      energy: 4
+    });
   });
 
   it("adds a track to the default favorites playlist", () => {

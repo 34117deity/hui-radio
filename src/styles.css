@@ -77,6 +77,9 @@ textarea {
   --panel-strong: rgba(7, 11, 19, 0.92);
   --surface: rgba(255, 255, 255, 0.03);
   --surface-strong: rgba(255, 255, 255, 0.06);
+  --range-track: rgba(255, 255, 255, 0.14);
+  --scroll-track: rgba(255, 255, 255, 0.08);
+  --scroll-thumb: rgba(245, 247, 252, 0.42);
   --text: #f5f7fc;
   --muted: #9ca3af;
   --hairline: rgba(255, 255, 255, 0.08);
@@ -100,6 +103,7 @@ textarea {
     linear-gradient(145deg, var(--page-bg), #05080f 60%, #04070c);
   animation: page-drift 24s ease-in-out infinite alternate;
   transition: background 280ms ease, color 280ms ease;
+  scrollbar-color: var(--scroll-thumb) var(--scroll-track);
 }
 
 .radio-page.theme-light {
@@ -108,6 +112,9 @@ textarea {
   --panel-strong: rgba(255, 255, 255, 0.95);
   --surface: rgba(20, 30, 45, 0.03);
   --surface-strong: rgba(20, 30, 45, 0.06);
+  --range-track: rgba(20, 30, 45, 0.12);
+  --scroll-track: rgba(20, 30, 45, 0.05);
+  --scroll-thumb: rgba(17, 24, 39, 0.34);
   --text: #111827;
   --muted: #6b7280;
   --hairline: rgba(16, 24, 40, 0.09);
@@ -123,6 +130,29 @@ textarea {
     linear-gradient(150deg, rgba(189, 225, 255, 0.28), transparent 35%),
     linear-gradient(210deg, rgba(198, 191, 255, 0.18), transparent 32%),
     linear-gradient(145deg, #f5f8fc, #eef3f9 60%, #e9eff8);
+}
+
+.radio-page ::-webkit-scrollbar {
+  width: 12px;
+  height: 12px;
+}
+
+.radio-page ::-webkit-scrollbar-track {
+  background: var(--scroll-track);
+  border-radius: 999px;
+}
+
+.radio-page ::-webkit-scrollbar-thumb {
+  min-height: 36px;
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background: var(--scroll-thumb);
+  background-clip: padding-box;
+}
+
+.radio-page ::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--scroll-thumb) 78%, var(--text));
+  background-clip: padding-box;
 }
 
 .radio-shell {
@@ -400,7 +430,7 @@ textarea {
 
 .transport-panel {
   display: grid;
-  grid-template-columns: minmax(180px, 1fr) auto minmax(96px, 0.4fr);
+  grid-template-columns: minmax(150px, 1fr) max-content minmax(92px, 0.32fr) minmax(92px, 0.32fr);
   gap: var(--space-md);
   align-items: center;
   padding: var(--space-lg) var(--space-xl) var(--space-md);
@@ -462,8 +492,9 @@ textarea {
 
 .transport-buttons {
   gap: 6px;
-  flex-wrap: wrap;
-  justify-content: flex-end;
+  flex-wrap: nowrap;
+  justify-content: center;
+  min-width: max-content;
 }
 
 .primary-controls,
@@ -474,7 +505,7 @@ textarea {
 }
 
 .secondary-controls {
-  opacity: 0.72;
+  opacity: 0.86;
 }
 
 .transport-buttons button,
@@ -580,6 +611,33 @@ textarea {
   color: var(--muted);
 }
 
+.tts-volume-control {
+  justify-self: end;
+}
+
+.tts-volume-button {
+  width: 30px;
+  aspect-ratio: 1;
+  border: 1px solid var(--hairline);
+  border-radius: 999px;
+  display: inline-grid;
+  place-items: center;
+  color: var(--text);
+  background: var(--surface);
+  flex: 0 0 auto;
+  cursor: pointer;
+  transition:
+    transform 180ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    background-color 180ms ease,
+    box-shadow 180ms ease;
+}
+
+.tts-volume-button:hover {
+  transform: translateY(-1px);
+  background: var(--surface-strong);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+}
+
 .volume-control input {
   min-width: 0;
 }
@@ -613,8 +671,8 @@ input[type="range"]::-webkit-slider-runnable-track {
     to right,
     var(--accent) 0%,
     var(--accent) var(--range-progress, 0%),
-    var(--surface-strong) var(--range-progress, 0%),
-    var(--surface-strong) 100%
+    var(--range-track) var(--range-progress, 0%),
+    var(--range-track) 100%
   );
   border-radius: 999px;
   transition: background 240ms ease;
@@ -623,7 +681,7 @@ input[type="range"]::-webkit-slider-runnable-track {
 input[type="range"]::-moz-range-track {
   width: 100%;
   height: 6px;
-  background: var(--surface-strong);
+  background: var(--range-track);
   border-radius: 999px;
   transition: background 240ms ease;
 }
@@ -1383,6 +1441,7 @@ textarea::placeholder {
 
   .transport-buttons {
     justify-content: center;
+    min-width: 0;
   }
 
   .primary-controls {
@@ -1396,6 +1455,10 @@ textarea::placeholder {
   .volume-control {
     width: min(240px, 100%);
     justify-self: center;
+  }
+
+  .tts-volume-control {
+    width: min(220px, 100%);
   }
 
   .context-panel,

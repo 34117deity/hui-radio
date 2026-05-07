@@ -9,7 +9,6 @@ import {
   Moon,
   Pause,
   Play,
-  Plus,
   Radio,
   RefreshCw,
   RotateCcw,
@@ -22,11 +21,14 @@ import {
   Sun,
   Trash2,
   Upload,
+  Volume1,
   Volume2,
   X
 } from "lucide-react";
 import { radioApi } from "./api";
-import type { AiContext, ChatEntry, PlayableTrack, QueueItem, ReplySegment, Track, TrackInput } from "./types";
+import { loadPreferences, pickPreferenceWeightedTrack, recordPreferenceEvent, savePreferences } from "./preferences";
+import type { Preferences } from "./preferences";
+import type { AiContext, ChatEntry, PlayableTrack, ReplySegment, Track, TrackInput } from "./types";
 import "./styles.css";
 
 type UiLogLevel = "info" | "warn" | "error";
@@ -40,7 +42,6 @@ type UiLog = {
 };
 
 type PlayTrackOptions = {
-  queueId?: number | null;
   persist?: boolean;
   source?: string;
 };
@@ -188,10 +189,9 @@ const waveBars = Array.from({ length: 36 }, (_, index) => 18 + Math.round(Math.a
 
 function App() {
   const [tracks, setTracks] = useState<Track[]>([]);
-  const [queue, setQueue] = useState<QueueItem[]>([]);
   const [favorites, setFavorites] = useState<Set<number>>(new Set());
+  const [preferences, setPreferences] = useState(() => loadPreferences());
   const [current, setCurrent] = useState<PlayableTrack | null>(null);
-  const [currentQueueId, setCurrentQueueId] = useState<number | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [status, setStatus] = useState("Hui Radio backend online");
   const [theme, setTheme] = useState<"theme-dark" | "theme-light">("theme-dark");
@@ -217,6 +217,7 @@ function App() {
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [volume, setVolume] = useState(0.72);
+  const [ttsVolume, setTtsVolume] = useState(1);
   const [clock, setClock] = useState(new Date());
   const [logs, setLogs] = useState<UiLog[]>([]);
   const [logOpen, setLogOpen] = useState(false);
@@ -260,14 +261,20 @@ function App() {
     setLogOpen(true);
   };
 
+  const recordUserPreference = (track: PlayableTrack | null, event: Parameters<typeof recordPreferenceEvent>[2]): Preferences | null => {
+    if (!track) return null;
+    const next = recordPreferenceEvent(preferences, track, event);
+    savePreferences(next);
+    setPreferences(next);
+    return next;
+  };
+
   const refresh = async () => {
-    const [tracksData, queueData, playlistsData] = await Promise.all([
+    const [tracksData, playlistsData] = await Promise.all([
       radioApi.tracks(),
-      radioApi.queue(),
       radioApi.playlists()
     ]);
     setTracks(tracksData.tracks);
-    setQueue(queueData.queue);
     const defaultPlaylist = playlistsData.playlists.find((p) => p.name === "default");
     if (defaultPlaylist?.trackIds) {
       setFavorites(new Set(defaultPlaylist.trackIds));
@@ -317,6 +324,10 @@ function App() {
   }, [volume]);
 
   useEffect(() => {
+    if (voiceAudioRef.current) voiceAudioRef.current.volume = ttsVolume;
+  }, [ttsVolume]);
+
+  useEffect(() => {
     if (!backendOpen) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") setBackendOpen(false);
@@ -339,20 +350,19 @@ function App() {
     if (isSavedTrack(track)) return track;
     const data = await radioApi.saveTrack(track);
     setTracks((prev) => [data.track, ...prev.filter((item) => item.id !== data.track.id)]);
+    await refresh();
     return data.track;
   };
 
   const playTrack = async (track: PlayableTrack, options?: PlayTrackOptions) => {
     const token = ++playbackTokenRef.current;
     const persist = options?.persist !== false;
-    const queueId = options?.queueId ?? null;
     pushStatus(`Resolving ${track.title}`, "info", options?.source || "player");
 
     let targetTrack = track;
     if (!isSavedTrack(track) && persist) {
       targetTrack = await saveTrackIfNeeded(track);
     }
-
     let data: Awaited<ReturnType<typeof resolvePlayable>>;
     try {
       data = await resolvePlayable(targetTrack);
@@ -373,13 +383,14 @@ function App() {
       }
     }
     if (token !== playbackTokenRef.current) return;
+    const isRepeatPlayback = isSavedTrack(targetTrack) && currentSavedTrackId === targetTrack.id && options?.source !== "auto";
 
     const nextUrl = cacheBustPlaybackUrl(data.playbackUrl || data.url);
     const audio = audioRef.current;
     setCurrent(targetTrack);
-    setCurrentQueueId(queueId);
     setCurrentTime(0);
     setDuration(0);
+    if (isRepeatPlayback) recordUserPreference(targetTrack, "repeat");
     pushStatus(data.cached ? "Using cached stream" : "Stream ready", "info", "player");
 
     if (audio) {
@@ -413,14 +424,9 @@ function App() {
     const saved = await saveTrackIfNeeded(track);
     await radioApi.favorite({ trackId: saved.id });
     setFavorites((prev) => new Set([...prev, saved.id]));
+    recordUserPreference(saved, "favorite");
+    await refresh();
     pushStatus(`${saved.title} added to favorites`, "info", "favorite");
-  };
-
-  const enqueueTrack = async (track: PlayableTrack) => {
-    const saved = await saveTrackIfNeeded(track);
-    const data = await radioApi.enqueue([saved.id]);
-    setQueue(data.queue);
-    pushStatus(`${saved.title} queued`, "info", "queue");
   };
 
   const removeLibraryTrack = async (track: Track) => {
@@ -430,7 +436,6 @@ function App() {
       audioRef.current?.pause();
       if (audioRef.current) audioRef.current.removeAttribute("src");
       setCurrent(null);
-      setCurrentQueueId(null);
       setCurrentTime(0);
       setDuration(0);
     }
@@ -438,8 +443,8 @@ function App() {
     const previousTracks = tracks;
     setTracks((prev) => prev.filter((item) => item.id !== track.id));
     try {
-      const data = await radioApi.removeTrack(track.id);
-      setQueue(data.queue);
+      await radioApi.removeTrack(track.id);
+      await refresh();
       pushStatus(`${track.title} removed from library`, "info", "library");
     } catch (error) {
       setTracks(previousTracks);
@@ -456,30 +461,14 @@ function App() {
   };
 
   const advance = async (statusForCurrent: "played" | "skipped") => {
-    let latestQueue = queue;
     const currentTrackId = currentSavedTrackId;
-    if (currentQueueId) {
-      const data = await radioApi.markQueue(currentQueueId, statusForCurrent);
-      latestQueue = data.queue;
-      setQueue(data.queue);
-      setCurrentQueueId(null);
-    } else if (currentTrackId && latestQueue[0]?.trackId === currentTrackId) {
-      const data = await radioApi.markQueue(latestQueue[0].id, statusForCurrent);
-      latestQueue = data.queue;
-      setQueue(data.queue);
-    }
-    const nextItem = currentTrackId ? latestQueue.find((item) => item.trackId !== currentTrackId) || latestQueue[0] : latestQueue[0];
-    if (nextItem) {
-      await playTrack(nextItem.track, { queueId: nextItem.id, source: "queue" });
-      return;
-    }
+    const nextPreferences = recordUserPreference(current, statusForCurrent === "played" ? "completed" : "skipped") || preferences;
     if (!tracks.length) {
-      pushStatus("Library is empty, import songs first", "warn", "queue");
+      pushStatus("Library is empty, import songs first", "warn", "player");
       return;
     }
-    const index = findTrackIndex(currentTrackId);
-    const fallback = tracks[(index + 1 + tracks.length) % tracks.length];
-    if (fallback) await playTrack(fallback, { source: "queue" });
+    const fallback = pickPreferenceWeightedTrack(tracks, currentTrackId, nextPreferences);
+    if (fallback) await playTrack(fallback, { source: "auto" });
   };
 
   const previousTrack = async () => {
@@ -488,11 +477,6 @@ function App() {
       return;
     }
     if (!currentSavedTrackId) {
-      const fromQueue = queue[0]?.track;
-      if (fromQueue) {
-        await playTrack(fromQueue, { queueId: queue[0].id, source: "queue" });
-        return;
-      }
       await playTrack(tracks[tracks.length - 1], { source: "player" });
       return;
     }
@@ -540,7 +524,6 @@ function App() {
     pushStatus("Hui Radio is thinking", "info", "ai");
 
     const data = await radioApi.askAi(text, aiContext, true);
-    setQueue(data.queue);
     const assistantText = data.externalSearchError ? `${data.action.say}\n（外部搜索失败：${data.externalSearchError}）` : data.action.say;
     setChat((prev) => [
       ...prev,
@@ -561,55 +544,6 @@ function App() {
     }
 
     speakText(data.action.say).catch((error) => reportError("tts", error));
-
-    const request = extractRequestSafe(text);
-    const localMatchThreshold = request.artist ? 95 : 70;
-    const externalMatchThreshold = request.artist ? 95 : 80;
-    const bestLocal = request.title ? pickBestLocalTrack(tracks, request.title, request.artist) : undefined;
-    if (bestLocal && bestLocal.score >= localMatchThreshold) {
-      await playTrack(bestLocal.candidate, { source: "ai-local" });
-      pushStatus(`Playing requested song: ${bestLocal.candidate.title}`, "info", "ai");
-      return;
-    }
-
-    if (data.action.playTrackId) {
-      const fromQueue = data.queue.find((item) => item.trackId === data.action.playTrackId)?.track;
-      const fromLocalState = tracks.find((track) => track.id === data.action.playTrackId);
-      let target = fromQueue || fromLocalState;
-      if (!target) {
-        const latestTracks = await radioApi.tracks();
-        setTracks(latestTracks.tracks);
-        target = latestTracks.tracks.find((track) => track.id === data.action.playTrackId);
-      }
-      if (target) {
-        if (request.title) {
-          const score = scoreCandidate(target, request.title, request.artist);
-          if (score < localMatchThreshold) {
-            pushStatus(`AI picked ${target.title}, but it does not match your request "${request.title}"`, "warn", "ai");
-          } else {
-            await playTrack(target, { source: "ai-local" });
-            return;
-          }
-        } else {
-          await playTrack(target, { source: "ai-local" });
-          return;
-        }
-      }
-      pushStatus(`AI selected track #${data.action.playTrackId}, but it is not in local library`, "warn", "ai");
-    }
-
-    if (data.externalCandidates.length > 0) {
-      const best = pickBestCandidate(data.externalCandidates, request.title, request.artist);
-      if (best && best.score >= externalMatchThreshold) {
-        await playTrack(best.candidate, { persist: false, source: "ai-external" });
-        pushStatus(`Playing external match: ${best.candidate.title}`, "info", "ai");
-        return;
-      }
-    }
-
-    if (!current && data.queue.length > 0) {
-      await playTrack(data.queue[0].track, { queueId: data.queue[0].id, source: "queue" });
-    }
   };
 
   const importQq = async () => {
@@ -709,14 +643,14 @@ function App() {
                     return;
                   }
                   if (current) {
-                    playTrack(current, { queueId: currentQueueId, source: "player", persist: isSavedTrack(current) }).catch((error) => reportError("player", error));
+                    playTrack(current, { source: "player", persist: isSavedTrack(current) }).catch((error) => reportError("player", error));
                   }
                 }}
                 title={isPlaying ? "Pause" : "Play"}
               >
                 {isPlaying ? <Pause size={17} /> : <Play size={17} />}
               </button>
-              <button type="button" onClick={() => advance("skipped").catch((error) => reportError("queue", error))} title="Next"><SkipForward size={16} /></button>
+              <button type="button" onClick={() => advance("skipped").catch((error) => reportError("player", error))} title="Next"><SkipForward size={16} /></button>
             </div>
             <div className="secondary-controls">
               <button
@@ -734,7 +668,35 @@ function App() {
           </div>
           <div className="volume-control">
             <Volume2 size={15} />
-            <input type="range" min="0" max="1" step="0.01" value={volume} onChange={(event) => setVolume(Number(event.target.value))} />
+            <input
+              type="range"
+              min="0"
+              max="1"
+              step="0.01"
+              value={volume}
+              style={{ "--range-progress": `${volume * 100}%` } as React.CSSProperties}
+              onChange={(event) => setVolume(Number(event.target.value))}
+            />
+          </div>
+          <div className="volume-control tts-volume-control">
+            <button
+              type="button"
+              className="tts-volume-button"
+              onClick={() => setTtsVolume((value) => (value >= 0.95 ? 0.7 : Math.min(1, value + 0.15)))}
+              title={`TTS volume ${Math.round(ttsVolume * 100)}%`}
+            >
+              <Volume1 size={14} />
+            </button>
+            <input
+              type="range"
+              min="0"
+              max="1"
+              step="0.01"
+              value={ttsVolume}
+              style={{ "--range-progress": `${ttsVolume * 100}%` } as React.CSSProperties}
+              aria-label="TTS volume"
+              onChange={(event) => setTtsVolume(Number(event.target.value))}
+            />
           </div>
           <div className="progress-line">
             <span>{formatDuration(currentTime)}</span>
@@ -744,6 +706,7 @@ function App() {
               max={duration || 0}
               step="1"
               value={Math.min(currentTime, duration || 0)}
+              style={{ "--range-progress": `${duration ? (Math.min(currentTime, duration) / duration) * 100 : 0}%` } as React.CSSProperties}
               onChange={(event) => {
                 const next = Number(event.target.value);
                 if (audioRef.current) audioRef.current.currentTime = next;
@@ -756,11 +719,6 @@ function App() {
 
         {!collapsed && (
           <>
-            <section className="queue-strip">
-              <div><span className="live-dot" />Hui Radio</div>
-              <strong>{queue.length} TRACKS</strong>
-            </section>
-
             <section className="chat-panel">
               <div className="server-note">Hui Radio · Live Broadcast</div>
               {chat.map((entry) => (
@@ -797,16 +755,6 @@ function App() {
                               title="Add to favorites"
                             >
                               <Heart size={15} />
-                            </button>
-                            <button
-                              type="button"
-                              onClick={(event) => {
-                                event.stopPropagation();
-                                enqueueTrack(candidate).catch((error) => reportError("queue", error));
-                              }}
-                              title="Queue"
-                            >
-                              <Plus size={15} />
                             </button>
                           </div>
                         ))}
@@ -925,7 +873,7 @@ function App() {
         onPlay={() => setIsPlaying(true)}
         onPause={() => setIsPlaying(false)}
         onError={() => reportError("player", "Audio playback failed: source unavailable or blocked")}
-        onEnded={() => advance("played").catch((error) => reportError("queue", error))}
+        onEnded={() => advance("played").catch((error) => reportError("player", error))}
         onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
         onLoadedMetadata={(event) => setDuration(event.currentTarget.duration || 0)}
       />
