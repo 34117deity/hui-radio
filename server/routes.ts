@@ -8,6 +8,7 @@ import {
   attachTrackToPlaylist,
   enqueueTracks,
   getDefaultFavoritesPlaylist,
+  listRecentAiMessages,
   getPlaylist,
   getTrack,
   listPlaylists,
@@ -219,10 +220,16 @@ api.get("/music/stream-external/:token", async (req, res, next) => {
   }
 });
 
+api.get("/ai/history", (req, res) => {
+  const query = z.object({ sessionId: z.string().min(1), limit: z.coerce.number().int().positive().max(40).default(24) }).parse(req.query);
+  res.json({ messages: listRecentAiMessages(query.sessionId, query.limit) });
+});
+
 api.post("/ai/chat", async (req, res, next) => {
   try {
     const body = z
       .object({
+        sessionId: z.string().min(1).optional(),
         message: z.string().min(1),
         context: z
           .object({
@@ -239,7 +246,11 @@ api.post("/ai/chat", async (req, res, next) => {
         allowExternal: z.boolean().default(true)
       })
       .parse(req.body);
-    const action = await askAi(body.message, { context: body.context, allowExternal: body.allowExternal });
+    const action = await askAi(body.message, {
+        sessionId: body.sessionId,
+      context: body.context,
+      allowExternal: body.allowExternal
+    });
     if (action.queueTrackIds?.length) enqueueTracks(action.queueTrackIds);
 
     let externalCandidates: Awaited<ReturnType<typeof searchQqSongs>> = [];
@@ -262,6 +273,7 @@ api.post("/ai/welcome", async (req, res, next) => {
   try {
     const body = z
       .object({
+        sessionId: z.string().min(1).optional(),
         context: z
           .object({
             city: z.string().optional(),
@@ -277,7 +289,7 @@ api.post("/ai/welcome", async (req, res, next) => {
         trackCount: z.number().int().nonnegative().optional()
       })
       .parse(req.body);
-    res.json(await createWelcome({ context: body.context, trackCount: body.trackCount }));
+    res.json(await createWelcome({ sessionId: body.sessionId, context: body.context, trackCount: body.trackCount }));
   } catch (error) {
     next(error);
   }

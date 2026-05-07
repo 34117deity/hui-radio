@@ -31,5 +31,6 @@ export const config = {
   dataDir: path.join(rootDir, "data"),
   cacheDir: path.join(rootDir, "cache"),
   ttsCacheDir: path.join(rootDir, "cache", "tts"),
-  distDir: path.join(rootDir, "dist")
+  distDir: path.join(rootDir, "dist"),
+  agentsMemoryPath: path.join(rootDir, "AGENTS.md")
 };

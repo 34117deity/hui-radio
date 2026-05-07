@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
 import { config } from "./config.js";
-import type { Playlist, QueueItem, Track, TrackInput } from "./types.js";
+import type { AiMemoryState, AiMessage, Playlist, QueueItem, Track, TrackInput } from "./types.js";
 
 fs.mkdirSync(config.dataDir, { recursive: true });
 fs.mkdirSync(config.cacheDir, { recursive: true });
@@ -69,9 +69,17 @@ CREATE TABLE IF NOT EXISTS plays (
 
 CREATE TABLE IF NOT EXISTS ai_messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL DEFAULT 'legacy',
   role TEXT NOT NULL,
   content TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS ai_memory_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  active_session_id TEXT,
+  last_summary_message_id INTEGER NOT NULL DEFAULT 0,
+  last_summary_at TEXT
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tracks_identity
@@ -89,6 +97,28 @@ const trackColumns = db.prepare("PRAGMA table_info(tracks)").all() as Array<{ na
 if (!trackColumns.some((column) => column.name === "removed_at")) {
   db.prepare("ALTER TABLE tracks ADD COLUMN removed_at TEXT").run();
 }
+
+const aiMessageColumns = db.prepare("PRAGMA table_info(ai_messages)").all() as Array<{ name: string }>;
+if (!aiMessageColumns.some((column) => column.name === "session_id")) {
+  db.prepare("ALTER TABLE ai_messages ADD COLUMN session_id TEXT").run();
+  db.prepare("UPDATE ai_messages SET session_id = 'legacy' WHERE session_id IS NULL OR session_id = ''").run();
+}
+
+db.prepare(
+  `INSERT INTO ai_memory_state (id, active_session_id, last_summary_message_id, last_summary_at)
+   VALUES (1, NULL, 0, NULL)
+   ON CONFLICT(id) DO NOTHING`
+).run();
+
+db.prepare("CREATE INDEX IF NOT EXISTS idx_ai_messages_session_created ON ai_messages (session_id, id DESC)").run();
+
+const aiMessageRow = (row: Record<string, unknown>): AiMessage => ({
+  id: Number(row.id),
+  sessionId: String(row.session_id || "legacy"),
+  role: String(row.role) as AiMessage["role"],
+  content: String(row.content),
+  createdAt: String(row.created_at)
+});
 
 const playlistRow = (row: Record<string, unknown>): Playlist => ({
   id: Number(row.id),
@@ -257,6 +287,64 @@ export function listQueue(): QueueItem[] {
   }));
 }
 
-export function saveAiMessage(role: "user" | "assistant", content: string) {
-  db.prepare("INSERT INTO ai_messages (role, content) VALUES (?, ?)").run(role, content);
+export function saveAiMessage(sessionId: string, role: "user" | "assistant", content: string) {
+  const normalizedSessionId = sessionId.trim() || "default";
+  const tx = db.transaction((nextSessionId: string, nextRole: "user" | "assistant", nextContent: string) => {
+    db.prepare("INSERT INTO ai_messages (session_id, role, content) VALUES (?, ?, ?)").run(nextSessionId, nextRole, nextContent);
+    db.prepare("UPDATE ai_memory_state SET active_session_id = ? WHERE id = 1").run(nextSessionId);
+  });
+  tx(normalizedSessionId, role, content);
+}
+
+export function listRecentAiMessages(sessionId: string, limit = 8): AiMessage[] {
+  const normalizedSessionId = sessionId.trim() || "default";
+  const rows = db
+    .prepare(
+      `SELECT id, session_id, role, content, created_at
+       FROM ai_messages
+       WHERE session_id = ?
+       ORDER BY id DESC
+       LIMIT ?`
+    )
+    .all(normalizedSessionId, limit) as Record<string, unknown>[];
+  return rows.reverse().map(aiMessageRow);
+}
+
+export function listAiMessagesSince(afterId = 0, limit = 24): AiMessage[] {
+  return (
+    db
+      .prepare(
+        `SELECT id, session_id, role, content, created_at
+         FROM ai_messages
+         WHERE id > ?
+         ORDER BY id ASC
+         LIMIT ?`
+      )
+      .all(afterId, limit) as Record<string, unknown>[]
+  ).map(aiMessageRow);
+}
+
+export function getAiMemoryState(): AiMemoryState {
+  const row = db.prepare("SELECT active_session_id, last_summary_message_id, last_summary_at FROM ai_memory_state WHERE id = 1").get() as
+    | { active_session_id?: string | null; last_summary_message_id?: number; last_summary_at?: string | null }
+    | undefined;
+
+  return {
+    activeSessionId: row?.active_session_id || undefined,
+    lastSummaryMessageId: Number(row?.last_summary_message_id || 0),
+    lastSummaryAt: row?.last_summary_at || undefined
+  };
+}
+
+export function updateAiMemoryState(patch: Partial<AiMemoryState>) {
+  const current = getAiMemoryState();
+  db.prepare(
+    `UPDATE ai_memory_state
+     SET active_session_id = ?, last_summary_message_id = ?, last_summary_at = ?
+     WHERE id = 1`
+  ).run(
+    patch.activeSessionId ?? current.activeSessionId ?? null,
+    patch.lastSummaryMessageId ?? current.lastSummaryMessageId,
+    patch.lastSummaryAt ?? current.lastSummaryAt ?? null
+  );
 }

@@ -5,8 +5,9 @@ import OpenAI from "openai";
 import { ProxyAgent, fetch as undiciFetch } from "undici";
 import { z } from "zod";
 import { config } from "../config.js";
-import { listQueue, listTracks, saveAiMessage } from "../db.js";
-import type { Track } from "../types.js";
+import { getAiMemoryState, listAiMessagesSince, listQueue, listRecentAiMessages, listTracks, saveAiMessage, updateAiMemoryState } from "../db.js";
+import { DEFAULT_AUTO_MEMORY, ensureAgentsMemoryFile, readAutoMemory, writeAutoMemory } from "./memory.js";
+import type { AiMessage, Track } from "../types.js";
 
 type RequestOptions = { signal: AbortSignal; timeout: number; maxRetries: number };
 
@@ -27,6 +28,8 @@ type ClaudeMessageResponse = {
   content?: Array<{ type?: string; text?: string }>;
   error?: { message?: string };
 };
+
+type ChatMessageParam = { role: "user" | "assistant"; content: string };
 
 export interface AiRequestContext {
   city?: string;
@@ -164,9 +167,22 @@ const welcomePrompt = [
   "\u4f60\u662f Hui Radio \u7684\u4e2d\u6587 AI \u7535\u53f0\u4e3b\u64ad\u3002",
   "\u8bf7\u751f\u6210\u4e00\u6761\u9996\u6b21\u8fdb\u5165\u9875\u9762\u7684\u968f\u673a\u6b22\u8fce\u53e3\u64ad\uff0c\u4e2d\u6587\uff0c40 \u5230 90 \u5b57\u3002",
   "\u8bed\u6c14\u8981\u50cf\u771f\u6b63\u7684\u6df1\u591c\u65e5\u5e38\u7535\u53f0\u4e3b\u64ad\uff0c\u6e29\u67d4\u3001\u677e\u5f1b\u3001\u6709\u753b\u9762\u611f\u3002",
-  "\u53ef\u4ee5\u53c2\u8003\u5f53\u524d\u65f6\u95f4\u3001\u66f2\u5e93\u6570\u91cf\u3001\u5f53\u524d\u6b4c\u66f2\u3001\u57ce\u5e02\u3001\u5929\u6c14\u3001\u5fc3\u60c5\u3001\u65f6\u95f4\u6bb5\u3002",
+  "\u53ef\u4ee5\u53c2\u8003\u5f53\u524d\u65f6\u95f4\u3001\u66f2\u5e93\u6570\u91cf\u3001\u5f53\u524d\u6b4c\u66f2\u3001\u57ce\u5e02\u3001\u5929\u6c14\u3001\u5fc3\u60c5\u3001\u65f6\u95f4\u6bb5\uff0c\u4ee5\u53ca AGENTS \u8bb0\u5fd8\u4e2d\u7684\u957f\u671f\u504f\u597d\u3002",
   "\u4e0d\u8981 Markdown\uff0c\u4e0d\u8981\u5f15\u53f7\uff0c\u4e0d\u8981\u5217\u8868\uff0c\u53ea\u8f93\u51fa\u6b22\u8fce\u8bed\u6b63\u6587\u3002"
 ].join("\n");
+
+const memorySummaryPrompt = [
+  "You maintain Hui Radio's long-term listener memory.",
+  "Summarize only durable preferences and recurring habits from the new conversation snippets.",
+  "Keep stable facts only: music tastes, preferred tone, language style, recurring goals, repeated constraints.",
+  "Do not include one-off requests, transient moods, timestamps, or implementation details.",
+  "Return 3 to 8 short Markdown bullet points in English or Chinese.",
+  `If nothing durable is learned, return exactly: ${DEFAULT_AUTO_MEMORY}`
+].join("\n");
+
+const RECENT_MESSAGE_LIMIT = 8;
+const SUMMARY_BATCH_SIZE = 6;
+const SUMMARY_MIN_INTERVAL_MS = 5 * 60 * 1000;
 
 function normalize(value: string) {
   return value.toLowerCase().replace(/[\u3001\u3002\u300a\u300b\u300c\u300d\u300e\u300f\u201c\u201d\u2018\u2019"'`()[\]\uff08\uff09\s]/g, "");
@@ -278,7 +294,34 @@ export function setOpenAiClientForTests(nextClient: OpenAIClientLike | null) {
   hasOpenAiClientOverrideForTests = Boolean(nextClient);
 }
 
-async function createClaudeMessage(message: string, context: unknown, requestOptions: RequestOptions) {
+function toChatMessageParams(messages: AiMessage[]): ChatMessageParam[] {
+  return messages.map((entry) => ({ role: entry.role, content: entry.content }));
+}
+
+function sanitizeMemorySummary(text: string) {
+  const cleaned = text
+    .trim()
+    .replace(/^```[a-z]*\s*/i, "")
+    .replace(/```$/i, "")
+    .trim();
+  return cleaned || DEFAULT_AUTO_MEMORY;
+}
+
+function shouldRefreshMemory(pendingCount: number, lastSummaryAt?: string) {
+  if (pendingCount >= SUMMARY_BATCH_SIZE) return true;
+  if (!pendingCount) return false;
+  if (!lastSummaryAt) return true;
+  const elapsed = Date.now() - new Date(lastSummaryAt).getTime();
+  return Number.isFinite(elapsed) && elapsed >= SUMMARY_MIN_INTERVAL_MS;
+}
+
+async function createClaudeTextCompletion(
+  systemPrompt: string,
+  context: unknown,
+  messages: ChatMessageParam[],
+  maxTokens: number,
+  requestOptions: RequestOptions
+) {
   if (!config.OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
 
   const response = await rightCodesFetch(resolveClaudeMessagesUrl(), {
@@ -291,13 +334,17 @@ async function createClaudeMessage(message: string, context: unknown, requestOpt
     },
     body: JSON.stringify({
       model: config.OPENAI_TEXT_MODEL,
-      max_tokens: 220,
-      system: radioSystemPrompt,
+      max_tokens: maxTokens,
+      system: systemPrompt,
       messages: [
         {
           role: "user",
-          content: [{ type: "text", text: `User request: ${message}\nContext: ${JSON.stringify(context)}`, cache_control: { type: "ephemeral" } }]
-        }
+          content: [{ type: "text", text: `Context: ${JSON.stringify(context)}`, cache_control: { type: "ephemeral" } }]
+        },
+        ...messages.map((message) => ({
+          role: message.role,
+          content: [{ type: "text", text: message.content }]
+        }))
       ],
       stream: true
     })
@@ -313,44 +360,28 @@ async function createClaudeMessage(message: string, context: unknown, requestOpt
   return text;
 }
 
-async function createClaudeWelcome(context: unknown, requestOptions: RequestOptions) {
-  if (!config.OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
-
-  const response = await rightCodesFetch(resolveClaudeMessagesUrl(), {
-    method: "POST",
-    signal: requestOptions.signal,
-    headers: {
-      "content-type": "application/json",
-      "x-api-key": config.OPENAI_API_KEY,
-      authorization: `Bearer ${config.OPENAI_API_KEY}`
-    },
-    body: JSON.stringify({
-      model: config.OPENAI_TEXT_MODEL,
-      max_tokens: 100,
-      system: welcomePrompt,
-      messages: [{ role: "user", content: [{ type: "text", text: `Context: ${JSON.stringify(context)}`, cache_control: { type: "ephemeral" } }] }],
-      stream: true
-    })
-  });
-
-  if (!response.ok) {
-    const payload = (await response.json().catch(() => ({}))) as ClaudeMessageResponse;
-    throw new Error(`${response.status} ${payload.error?.message || response.statusText}`);
-  }
-  const text = await readAnthropicStreamText(response);
-  if (!text) throw new Error("Claude welcome response is empty");
-  return text;
+async function createClaudeMessage(context: unknown, messages: ChatMessageParam[], requestOptions: RequestOptions) {
+  return createClaudeTextCompletion(radioSystemPrompt, context, messages, 220, requestOptions);
 }
 
-async function createOpenAiCompatibleMessage(message: string, context: unknown, requestOptions: RequestOptions) {
+async function createClaudeWelcome(context: unknown, requestOptions: RequestOptions) {
+  return createClaudeTextCompletion(welcomePrompt, context, [], 100, requestOptions);
+}
+
+async function createClaudeMemorySummary(context: unknown, messages: ChatMessageParam[], requestOptions: RequestOptions) {
+  return createClaudeTextCompletion(memorySummaryPrompt, context, messages, 220, requestOptions);
+}
+
+async function createOpenAiCompatibleMessage(context: unknown, messages: ChatMessageParam[], requestOptions: RequestOptions) {
   const response = await client!.chat.completions.create(
     {
       model: config.OPENAI_TEXT_MODEL,
       max_tokens: 220,
       messages: [
         { role: "system", content: radioSystemPrompt },
-        { role: "user", content: `User request: ${message}\nContext: ${JSON.stringify(context)}` }
-      ],
+        { role: "user", content: `Context: ${JSON.stringify(context)}` },
+        ...messages
+      ]
     } as never,
     requestOptions as never
   );
@@ -374,20 +405,82 @@ async function createOpenAiCompatibleWelcome(context: unknown, requestOptions: R
   return text.replace(/^["\u201c\u201d]|["\u201c\u201d]$/g, "");
 }
 
+async function createOpenAiCompatibleMemorySummary(context: unknown, messages: ChatMessageParam[], requestOptions: RequestOptions) {
+  const response = await client!.chat.completions.create(
+    {
+      model: config.OPENAI_TEXT_MODEL,
+      max_tokens: 220,
+      messages: [
+        { role: "system", content: memorySummaryPrompt },
+        { role: "user", content: `Context: ${JSON.stringify(context)}` },
+        ...messages
+      ]
+    } as never,
+    requestOptions as never
+  );
+  const text = response.choices?.[0]?.message?.content?.trim();
+  if (!text) throw new Error("OpenAI memory summary response is empty");
+  return text;
+}
+
+export async function refreshGlobalMemoryFromMessages(options?: { timeoutMs?: number }) {
+  await ensureAgentsMemoryFile();
+
+  const state = getAiMemoryState();
+  const pending = listAiMessagesSince(state.lastSummaryMessageId, 40);
+  if (!shouldRefreshMemory(pending.length, state.lastSummaryAt)) return;
+
+  const currentMemory = await readAutoMemory();
+  const context = {
+    currentMemory,
+    objective: "Extract only durable listener preferences for future welcome messages."
+  };
+  const messages = toChatMessageParams(pending);
+  const latestId = pending[pending.length - 1]?.id ?? state.lastSummaryMessageId;
+
+  if (!messages.length) return;
+  if (!client) {
+    updateAiMemoryState({ lastSummaryMessageId: latestId, lastSummaryAt: new Date().toISOString() });
+    return;
+  }
+
+  const timeoutMs = options?.timeoutMs ?? 8_000;
+  const summary = await withAbortableTimeout(
+    (requestOptions) =>
+      isClaudeTextModel()
+        ? createClaudeMemorySummary(context, messages, requestOptions)
+        : createOpenAiCompatibleMemorySummary(context, messages, requestOptions),
+    timeoutMs,
+    "Global memory summary"
+  );
+
+  await writeAutoMemory(sanitizeMemorySummary(summary));
+  updateAiMemoryState({
+    lastSummaryMessageId: latestId,
+    lastSummaryAt: new Date().toISOString()
+  });
+}
+
 export async function askAi(
   message: string,
-  options?: { timeoutMs?: number; context?: AiRequestContext; allowExternal?: boolean }
+  options?: { timeoutMs?: number; context?: AiRequestContext; allowExternal?: boolean; sessionId?: string }
 ): Promise<AiAction> {
-  saveAiMessage("user", message);
+  const sessionId = options?.sessionId?.trim() || "default";
+  saveAiMessage(sessionId, "user", message);
+  const recentMessages = listRecentAiMessages(sessionId, RECENT_MESSAGE_LIMIT);
+  const history = toChatMessageParams(recentMessages);
+
   if (!client) {
     const fallback = localFallbackV2(message, options?.allowExternal);
-    saveAiMessage("assistant", fallback.say);
+    saveAiMessage(sessionId, "assistant", fallback.say);
+    void refreshGlobalMemoryFromMessages().catch(() => undefined);
     return fallback;
   }
 
   const context = {
     tracks: listTracks(12).map((track) => ({ id: track.id, title: track.title, artist: track.artist, source: track.source })),
     queue: listQueue().slice(0, 6).map((item) => ({ id: item.track.id, title: item.track.title, artist: item.track.artist })),
+    recentConversation: recentMessages.map((entry) => ({ role: entry.role, content: entry.content })),
     listener: options?.context || {},
     allowExternal: Boolean(options?.allowExternal)
   };
@@ -401,13 +494,14 @@ export async function askAi(
         const text = await withAbortableTimeout(
           (requestOptions) =>
             attempt === 0
-              ? createOpenAiCompatibleMessage(message, context, requestOptions)
-              : createClaudeMessage(message, context, requestOptions),
+              ? createOpenAiCompatibleMessage(context, history, requestOptions)
+              : createClaudeMessage(context, history, requestOptions),
           timeoutMs,
           attempt === 0 ? "OpenAI response" : "Claude response"
         );
         const parsed = parseAiJson(text);
-        saveAiMessage("assistant", parsed.say);
+        saveAiMessage(sessionId, "assistant", parsed.say);
+        void refreshGlobalMemoryFromMessages().catch(() => undefined);
         return parsed;
       } catch (error) {
         lastError = error;
@@ -417,30 +511,44 @@ export async function askAi(
   } catch (error) {
     const fallback = localFallbackV2(message, options?.allowExternal);
     fallback.reason = `openai-fallback: ${error instanceof Error ? error.message : String(error)}`;
-    saveAiMessage("assistant", fallback.say);
+    saveAiMessage(sessionId, "assistant", fallback.say);
+    void refreshGlobalMemoryFromMessages().catch(() => undefined);
     return fallback;
   }
 }
 
 export async function createWelcome(
-  options?: { timeoutMs?: number; context?: AiRequestContext; trackCount?: number }
+  options?: { timeoutMs?: number; context?: AiRequestContext; trackCount?: number; sessionId?: string }
 ): Promise<{ say: string }> {
+  await ensureAgentsMemoryFile();
+  const globalMemory = await readAutoMemory();
   const context = {
     now: new Date().toISOString(),
     trackCount: options?.trackCount ?? listTracks().length,
-    listener: options?.context || {}
+    listener: options?.context || {},
+    globalMemory
   };
 
   if (!client) return { say: localWelcome(options?.context, context.trackCount) };
 
   try {
     const timeoutMs = options?.timeoutMs ?? 8_000;
-    const say = await withAbortableTimeout(
-      (requestOptions) => createOpenAiCompatibleWelcome(context, requestOptions),
-      timeoutMs,
-      "OpenAI welcome"
-    );
-    return { say: say.slice(0, 180) };
+    let lastError: unknown;
+    const attempts = isClaudeTextModel() ? 2 : 1;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      try {
+        const say = await withAbortableTimeout(
+          (requestOptions) =>
+            attempt === 0 ? createOpenAiCompatibleWelcome(context, requestOptions) : createClaudeWelcome(context, requestOptions),
+          timeoutMs,
+          attempt === 0 ? "OpenAI welcome" : "Claude welcome"
+        );
+        return { say: say.slice(0, 180) };
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError;
   } catch {
     return { say: localWelcome(options?.context, context.trackCount) };
   }

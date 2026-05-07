@@ -46,3 +46,17 @@ export interface QueueItem {
   createdAt: string;
   track: Track;
 }
+
+export interface AiMessage {
+  id: number;
+  sessionId: string;
+  role: "user" | "assistant";
+  content: string;
+  createdAt: string;
+}
+
+export interface AiMemoryState {
+  activeSessionId?: string;
+  lastSummaryMessageId: number;
+  lastSummaryAt?: string;
+}

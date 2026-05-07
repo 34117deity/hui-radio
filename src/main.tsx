@@ -26,7 +26,7 @@ import {
   X
 } from "lucide-react";
 import { radioApi } from "./api";
-import type { AiContext, AiHistoryMessage, ChatEntry, PlayableTrack, QueueItem, ReplySegment, Track, TrackInput } from "./types";
+import type { AiContext, ChatEntry, PlayableTrack, QueueItem, ReplySegment, Track, TrackInput } from "./types";
 import "./styles.css";
 
 type UiLogLevel = "info" | "warn" | "error";
@@ -185,29 +185,8 @@ function pickBestLocalTrack(candidates: Track[], title: string, artist: string) 
 }
 
 const waveBars = Array.from({ length: 36 }, (_, index) => 18 + Math.round(Math.abs(Math.sin(index * 0.72)) * 26 + Math.abs(Math.cos(index * 0.27)) * 18));
-const SESSION_STORAGE_KEY = "hui-radio-session-id";
-
-function getOrCreateSessionId() {
-  if (typeof window === "undefined") return `session-${Date.now()}`;
-  const existing = window.localStorage.getItem(SESSION_STORAGE_KEY)?.trim();
-  if (existing) return existing;
-  const created = `session-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-  window.localStorage.setItem(SESSION_STORAGE_KEY, created);
-  return created;
-}
-
-function historyMessageToChatEntry(entry: AiHistoryMessage): ChatEntry {
-  return {
-    id: `history-${entry.id}`,
-    role: entry.role,
-    text: entry.content,
-    time: new Date(entry.createdAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false }),
-    segments: entry.role === "assistant" ? buildReplySegments(entry.content) : undefined
-  };
-}
 
 function App() {
-  const [sessionId] = useState(() => getOrCreateSessionId());
   const [tracks, setTracks] = useState<Track[]>([]);
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [current, setCurrent] = useState<PlayableTrack | null>(null);
@@ -225,7 +204,15 @@ function App() {
   const [qqLink, setQqLink] = useState("");
   const [lxPayload, setLxPayload] = useState("");
   const [removingTrackIds, setRemovingTrackIds] = useState<number[]>([]);
-  const [chat, setChat] = useState<ChatEntry[]>([]);
+  const [chat, setChat] = useState<ChatEntry[]>([
+    {
+      id: "welcome",
+      role: "assistant",
+      text: "",
+      time: nowLabel(),
+      loading: true
+    }
+  ]);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [volume, setVolume] = useState(0.72);
@@ -542,7 +529,7 @@ function App() {
     setMessage("");
     pushStatus("Hui Radio is thinking", "info", "ai");
 
-    const data = await radioApi.askAi(sessionId, text, aiContext, true);
+    const data = await radioApi.askAi(text, aiContext, true);
     setQueue(data.queue);
     const assistantText = data.externalSearchError ? `${data.action.say}\n（外部搜索失败：${data.externalSearchError}）` : data.action.say;
     setChat((prev) => [
@@ -719,7 +706,6 @@ function App() {
               >
                 {isPlaying ? <Pause size={17} /> : <Play size={17} />}
               </button>
-              <button type="button" onClick={stopTrack} title="Stop"><Square size={15} /></button>
               <button type="button" onClick={() => advance("skipped").catch((error) => reportError("queue", error))} title="Next"><SkipForward size={16} /></button>
             </div>
             <div className="secondary-controls">
