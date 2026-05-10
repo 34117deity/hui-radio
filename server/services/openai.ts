@@ -5,8 +5,19 @@ import OpenAI from "openai";
 import { ProxyAgent, fetch as undiciFetch } from "undici";
 import { z } from "zod";
 import { config } from "../config.js";
-import { getAiMemoryState, listAiMessagesSince, listRecentAiMessages, listTracks, saveAiMessage, updateAiMemoryState } from "../db.js";
+import { getAiMemoryState, getTrack, listAiMessagesSince, listRecentAiMessages, listTracks, saveAiMessage, updateAiMemoryState } from "../db.js";
 import { DEFAULT_AUTO_MEMORY, ensureAgentsMemoryFile, readAutoMemory, writeAutoMemory } from "./memory.js";
+import {
+  classifyAiIntent,
+  extractSongRequest as extractSharedSongRequest,
+  normalizeKnownMusicAliases as normalizeSharedKnownMusicAliases,
+  stripSongCommandPrefix as stripSharedSongCommandPrefix,
+  wantsExternalCandidateSearch as wantsSharedExternalCandidateSearch,
+  wantsExternalRecommendation as wantsSharedExternalRecommendation,
+  wantsInstrumentalRecommendation as wantsSharedInstrumentalRecommendation,
+  wantsLibraryRecommendation as wantsSharedLibraryRecommendation,
+  wantsPlayback as wantsSharedPlayback
+} from "../../shared/aiIntent.js";
 import type { AiMessage, Track } from "../types.js";
 
 type RequestOptions = { signal: AbortSignal; timeout: number; maxRetries: number };
@@ -30,6 +41,8 @@ type ClaudeMessageResponse = {
 };
 
 type ChatMessageParam = { role: "user" | "assistant"; content: string };
+type PreferenceBucket = "artist" | "language" | "genre" | "mood" | "scene" | "tempo";
+type AiPreferences = Partial<Record<PreferenceBucket, Record<string, number>>>;
 
 export interface AiRequestContext {
   city?: string;
@@ -37,6 +50,7 @@ export interface AiRequestContext {
   mood?: string;
   timeSlot?: string;
   currentTrack?: Pick<Track, "id" | "title" | "artist" | "source"> | null;
+  preferences?: AiPreferences;
 }
 
 function resolveProxyUrl() {
@@ -64,9 +78,13 @@ function isClaudeTextModel() {
   return config.OPENAI_TEXT_MODEL.startsWith("claude-") && !hasOpenAiClientOverrideForTests;
 }
 
-function resolveClaudeMessagesUrl() {
+function isClaudeModel(model: string) {
+  return model.startsWith("claude-");
+}
+
+function resolveClaudeMessagesUrl(model: string) {
   const baseUrl = config.OPENAI_BASE_URL || "https://www.right.codes/claude/v1";
-  const claudePath = config.OPENAI_TEXT_MODEL.startsWith("claude-haiku-") ? "/claude-aws/v1/messages" : "/claude/v1/messages";
+  const claudePath = model.startsWith("claude-haiku-") ? "/claude-aws/v1/messages" : "/claude/v1/messages";
   try {
     const url = new URL(baseUrl);
     url.pathname = url.pathname.replace(/\/codex\/v1\/?$/, claudePath);
@@ -157,7 +175,12 @@ export type AiAction = z.infer<typeof aiActionSchema>;
 const radioSystemPrompt = [
   "\u4f60\u662f Hui Radio \u7684\u4e2d\u6587 AI \u7535\u53f0\u4e3b\u64ad\uff0c\u50cf\u771f\u4eba DJ \u4e00\u6837\u81ea\u7136\u8bf4\u8bdd\uff0c\u77ed\u53e5\u3001\u6e29\u67d4\u3001\u6709\u753b\u9762\u611f\u3002",
   "\u53ef\u4ee5\u4ece provided library \u91cc\u9009\u6b4c\uff0c\u53ea\u80fd\u4f7f\u7528\u4e0a\u4e0b\u6587\u4e2d\u771f\u5b9e\u5b58\u5728\u7684 track id\u3002",
+  "\u7528\u6237\u7684 preferences \u6765\u81ea\u64ad\u653e\u5b8c\u6210\u3001\u6536\u85cf\u3001\u91cd\u590d\u64ad\u653e\u548c\u8df3\u8fc7\u884c\u4e3a\uff1b\u63a8\u8350\u65f6\u8981\u4f18\u5148\u53c2\u8003 preferenceScore \u548c preferenceHints\u3002",
   "\u5982\u679c allowExternal \u4e3a true\uff0c\u4e14\u7528\u6237\u8bf4\u201c\u63a8\u8350\u201d\u3001\u201c\u6765\u4e00\u9996\u201d\u3001\u201c\u60f3\u542c\u65b0\u7684\u201d\u3001\u201c\u6ca1\u542c\u8fc7\u7684\u201d\uff0c\u4f18\u5148\u63a8\u8350\u66f2\u5e93\u5916\u6b4c\u66f2\uff1aplayTrackId \u8bbe\u4e3a null\uff0cexternalSearchQuery \u5199\u6210\u660e\u786e\u7684\u201c\u6b4c\u540d \u827a\u4eba\u201d\u641c\u7d22\u8bcd\u3002",
+  "\u5982\u679c\u7528\u6237\u5728\u70b9\u6b4c\u3001\u627e\u6b4c\uff0c\u6216\u8bf4\u201c\u67d0\u6b4c\u624b\u7684\u67d0\u9996\u6b4c/\u67d0\u82f1\u6587\u6b4c\u540d/\u8fd9\u9996\u53eb\u4ec0\u4e48\u201d\uff0c\u5fc5\u987b\u5148\u63d0\u53d6\u5e76\u7ea0\u9519\u6210\u6807\u51c6\u201c\u6b4c\u540d \u827a\u4eba\u201d\u641c\u7d22\u8bcd\uff1b\u4e0d\u8981\u53ea\u53e3\u64ad\u4e0d\u641c\u7d22\u3002",
+  "\u66f2\u5e93\u5916\u70b9\u6b4c\u9ed8\u8ba4\u53ea\u5c55\u793a\u5019\u9009\uff0c\u4e0d\u8981\u8bf4\u201c\u6b63\u5728\u64ad\u653e\u201d\u6216\u201c\u5c31\u7ed9\u4f60\u653e\u8d77\u6765\u201d\uff1b\u53e3\u64ad\u5e94\u8868\u8fbe\u201c\u6211\u5148\u628a\u5019\u9009\u627e\u51fa\u6765\uff0c\u4f60\u70b9\u60f3\u542c\u7684\u7248\u672c\u201d\u3002",
+  "\u63a8\u8350\u6b4c\u66f2\u65f6\u9ed8\u8ba4\u539f\u7248\u4f18\u5148\u3001\u6709\u4eba\u58f0\u4f18\u5148\uff1a\u539f\u5531/\u539f\u7248 > \u6b63\u5f0f\u5f55\u97f3\u5ba4\u7248/\u5b98\u65b9\u73b0\u573a\u7248 > \u7ffb\u5531/\u6539\u7f16/\u4f34\u594f/\u7eaf\u97f3\u4e50\u3002",
+  "\u9664\u975e\u7528\u6237\u660e\u786e\u8bf4\u8981\u7eaf\u97f3\u4e50\u3001instrumental\u3001BGM\u3001\u4f34\u594f\u3001\u65e0\u4eba\u58f0\u6216\u7c7b\u4f3c\u610f\u56fe\uff0c\u4e0d\u8981\u628a\u7eaf\u97f3\u4e50\u3001\u4f34\u594f\u3001lofi\u3001piano cover\u3001instrumental cover \u4f5c\u4e3a\u5e38\u89c4\u63a8\u8350\u3002",
   "\u53ea\u6709\u7528\u6237\u660e\u786e\u8bf4\u8981\u64ad\u653e\u672c\u5730\u3001\u6536\u85cf\u3001\u66f2\u5e93\u91cc\u7684\u6b4c\u65f6\uff0c\u624d\u4ece provided library \u9009\u6b4c\u3002\u4e0d\u8981\u7ed9\u66f2\u5e93\u5916\u6b4c\u66f2\u7f16\u9020 id\u3002",
   '\u53ea\u8fd4\u56de\u4e25\u683c JSON\uff1a{"say":"\u4e3b\u64ad\u53e3\u64ad\uff0c\u4e2d\u6587\uff0c80\u5b57\u4ee5\u5185","playTrackId":number|null,"reason":"optional","externalSearchQuery":string|null}\u3002',
   "\u4e0d\u8981\u8f93\u51fa Markdown\uff0c\u4e0d\u8981\u89e3\u91ca JSON\u3002"
@@ -183,38 +206,312 @@ const memorySummaryPrompt = [
 const RECENT_MESSAGE_LIMIT = 8;
 const SUMMARY_BATCH_SIZE = 6;
 const SUMMARY_MIN_INTERVAL_MS = 5 * 60 * 1000;
+const BEIJING_TIME_ZONE = "Asia/Shanghai";
+const preferenceBuckets: PreferenceBucket[] = ["artist", "language", "genre", "mood", "scene", "tempo"];
+
+function normalizeTag(value: string) {
+  return value.trim().replace(/\s+/g, " ");
+}
+
+function sanitizePreferences(input?: AiPreferences): AiPreferences {
+  const next: AiPreferences = {};
+  if (!input || typeof input !== "object") return next;
+  preferenceBuckets.forEach((bucket) => {
+    const weights = input[bucket];
+    if (!weights || typeof weights !== "object") return;
+    Object.entries(weights).forEach(([tag, value]) => {
+      const normalizedTag = normalizeTag(tag);
+      const numericValue = Number(value);
+      if (!normalizedTag || !Number.isFinite(numericValue) || numericValue === 0) return;
+      next[bucket] = { ...(next[bucket] || {}), [normalizedTag]: numericValue };
+    });
+  });
+  return next;
+}
+
+function tagValues(track: Partial<Record<PreferenceBucket, string | undefined>>, bucket: PreferenceBucket) {
+  const value = track[bucket];
+  if (!value) return [];
+  return String(value)
+    .split(/[\/,\u3001]+/u)
+    .map(normalizeTag)
+    .filter(Boolean);
+}
+
+function scoreTrackByPreferences(track: Partial<Record<PreferenceBucket, string | undefined>>, preferences?: AiPreferences) {
+  const safePreferences = sanitizePreferences(preferences);
+  return preferenceBuckets.reduce((score, bucket) => {
+    return score + tagValues(track, bucket).reduce((bucketScore, tag) => bucketScore + (safePreferences[bucket]?.[tag] || 0), 0);
+  }, 0);
+}
+
+function topPreferenceTerms(preferences?: AiPreferences, limit = 6) {
+  const safePreferences = sanitizePreferences(preferences);
+  return preferenceBuckets
+    .flatMap((bucket) => Object.entries(safePreferences[bucket] || {}).map(([tag, weight]) => ({ bucket, tag, weight })))
+    .filter((entry) => entry.weight > 0)
+    .sort((a, b) => b.weight - a.weight)
+    .slice(0, limit)
+    .map((entry) => `${entry.bucket}:${entry.tag}`);
+}
+
+function pickPreferenceWeightedLocalTrack(tracks: Track[], preferences?: AiPreferences, allowInstrumental = false) {
+  return [...tracks]
+    .map((track, index) => ({ track, index, score: scoreTrackByPreferences(track, preferences) + scoreSongVersionPreference(track, allowInstrumental) }))
+    .sort((a, b) => b.score - a.score || a.index - b.index)[0]?.track;
+}
 
 function normalize(value: string) {
   return value.toLowerCase().replace(/[\u3001\u3002\u300a\u300b\u300c\u300d\u300e\u300f\u201c\u201d\u2018\u2019"'`()[\]\uff08\uff09\s]/g, "");
 }
 
+function normalizeKnownMusicAliases(value: string) {
+  return normalizeSharedKnownMusicAliases(value);
+}
+
+function stripSongCommandPrefix(value: string) {
+  return stripSharedSongCommandPrefix(value);
+}
+
 function extractSongRequest(message: string) {
-  const quoted = message.match(/[\u300a\u300c\u300e\u201c"]([^\u300b\u300d\u300f\u201d"]+)[\u300b\u300d\u300f\u201d"]/)?.[1] || "";
-  const titleFromCommand = message.match(/(?:\u64ad\u653e|\u70b9\u64ad|\u6765\u4e00\u9996|\u60f3\u542c)\s*([^\s\uff0c\u3002\uff01\uff1f,.!?]{1,32})/)?.[1] || "";
-  const artist = message.match(/(?:by|\u6b4c\u624b|\u5531\u7684|\u7248\u672c|\u539f\u5531)\s*([^\s\uff0c\u3002\uff01\uff1f,.!?]+)/i)?.[1] || "";
-  const title = (quoted || titleFromCommand).replace(/(\u7136\u540e|\u4f46\u662f|\u4e0d\u8fc7|\u7ed9\u6211|\u987a\u4fbf).*$/u, "").trim();
-  return { title, artist: artist.trim() };
+  return extractSharedSongRequest(message);
 }
 
 function wantsExternalRecommendation(message: string) {
-  return /推荐|推薦|来一首|來一首|想听|想聽|找一首|没听过|沒聽過|新歌|陌生|随便|隨便|换一首|換一首|歌/i.test(message);
+  return wantsSharedExternalRecommendation(message);
 }
 
 function wantsLibraryRecommendation(message: string) {
-  return /曲库|曲庫|本地|收藏|我喜欢|我喜歡|库里|庫里|已有/i.test(message);
+  return wantsSharedLibraryRecommendation(message);
+}
+
+export function wantsExternalCandidateSearch(message: string) {
+  return wantsSharedExternalCandidateSearch(message);
+}
+
+export function wantsInstrumentalRecommendation(message: string) {
+  return wantsSharedInstrumentalRecommendation(message);
+}
+
+function wantsPlayback(message: string) {
+  return wantsSharedPlayback(message);
+}
+
+function formatBeijingNow() {
+  return new Date().toLocaleString("zh-CN", { timeZone: BEIJING_TIME_ZONE, hour12: false });
 }
 
 function buildExternalSearchQuery(message: string, requested: ReturnType<typeof extractSongRequest>, context?: AiRequestContext) {
-  if (requested.title) return `${requested.title}${requested.artist ? ` ${requested.artist}` : ""}`;
-  const hints = [context?.mood, context?.weather, context?.timeSlot, context?.city]
+  if (requested.title) return biasExternalSearchQuery(`${requested.title}${requested.artist ? ` ${requested.artist}` : ""}`, message);
+  const preferenceHints = topPreferenceTerms(context?.preferences, 4).map((hint) => hint.split(":").slice(1).join(":"));
+  const hints = [...preferenceHints, context?.mood, context?.weather, context?.timeSlot, context?.city]
     .filter((value): value is string => Boolean(value?.trim()))
     .slice(0, 3);
   const cleaned = message.replace(/[，。！？,.!?]/g, " ").replace(/\s+/g, " ").trim();
-  const requestHint = cleaned && !/^推荐|推薦|来一首|來一首|放歌|歌$/i.test(cleaned) ? cleaned.slice(0, 40) : "";
-  return [...hints, requestHint || "华语 流行 治愈"].join(" ");
+  const keepRequestHint = wantsInstrumentalRecommendation(message) || !/^推荐|推薦|来一首|來一首|放歌|歌$/i.test(cleaned);
+  const requestHint = cleaned && keepRequestHint ? cleaned.slice(0, 40) : "";
+  const defaultHint = wantsInstrumentalRecommendation(message) ? "纯音乐" : "华语 流行 治愈";
+  return biasExternalSearchQuery([...hints, requestHint || defaultHint].join(" "), message);
+}
+
+export function isLikelyInstrumentalCandidate(track: Pick<Track, "title" | "artist" | "album" | "genre" | "mood">) {
+  const searchable = [track.title, track.album, track.genre, track.mood].filter(Boolean).join(" ");
+  return /纯音乐|纯音|instrumental|伴奏|无人声|无人唱|无词|piano cover|instrumental cover|lofi|karaoke|off vocal/i.test(searchable);
+}
+
+export function scoreSongVersionPreference(track: Pick<Track, "title" | "artist" | "album" | "genre" | "mood">, allowInstrumental: boolean) {
+  const searchable = [track.title, track.album, track.genre, track.mood].filter(Boolean).join(" ");
+  let score = 0;
+  if (/原唱|原版|original|official|录音室/i.test(searchable)) score += 8;
+  if (/live|现场/i.test(searchable)) score += 3;
+  if (/翻唱|cover|改编|remix|remaster|钢琴版|吉他版/i.test(searchable)) score -= 8;
+  if (!allowInstrumental && isLikelyInstrumentalCandidate(track)) score -= 40;
+  return score;
+}
+
+export function biasExternalSearchQuery(query: string, message: string) {
+  const cleaned = normalizeKnownMusicAliases(query);
+  if (!cleaned || wantsInstrumentalRecommendation(message)) return cleaned;
+  const needsOriginal = !/原唱|原版|original|official/i.test(cleaned);
+  const needsVocal = !/人声|vocal/i.test(cleaned);
+  return [cleaned, needsOriginal ? "原唱" : "", needsVocal ? "人声" : ""].filter(Boolean).join(" ");
+}
+
+export function ensureExternalCandidateSearchForRequest(action: AiAction, message: string, context?: AiRequestContext, allowExternal = false): AiAction {
+  if (!allowExternal || wantsLibraryRecommendation(message) || !wantsExternalCandidateSearch(message)) return action;
+
+  const requested = extractSongRequest(message);
+  const assistantRequested = requested.title ? requested : extractSongRequest(action.say);
+  const rawSearchQuery = action.externalSearchQuery?.trim()
+    ? action.externalSearchQuery
+    : buildExternalSearchQuery(message, assistantRequested, context);
+  const shouldRestoreRequestedArtist =
+    requested.artist && !normalize(rawSearchQuery).includes(normalize(requested.artist));
+  const shouldRestoreRequestedTitle =
+    requested.title && !normalize(rawSearchQuery).includes(normalize(requested.title));
+  let externalSearchQuery = biasExternalSearchQuery(
+    [
+      shouldRestoreRequestedTitle ? requested.title : "",
+      shouldRestoreRequestedArtist ? requested.artist : "",
+      rawSearchQuery
+    ].filter(Boolean).join(" "),
+    message
+  );
+  if (/詹姆斯[·\s-]*布朗特|布朗特|james\s*blunt/i.test(message) && !/james\s*blunt/i.test(externalSearchQuery)) {
+    externalSearchQuery = `${externalSearchQuery} James Blunt`;
+  }
+  if (/you\s*(?:are|'?re)?\s*beautiful/i.test(message) && !/you'?re\s*beautiful/i.test(externalSearchQuery)) {
+    externalSearchQuery = `You're Beautiful ${externalSearchQuery}`;
+  }
+  externalSearchQuery = biasExternalSearchQuery(externalSearchQuery, message);
+
+  return {
+    ...action,
+    playTrackId: null,
+    externalSearchQuery,
+    say: requested.title
+      ? `我先把 ${requested.title}${requested.artist ? ` - ${requested.artist}` : ""} 的候选找出来，你点想听的版本。`
+      : action.say.replace(/(现在|馬上|马上)?就?给你放起来|正在播放|开始播放/g, "我先把候选找出来")
+  };
+}
+
+const actionReviewPrompt = [
+  "You are the second-pass auditor for Hui Radio.",
+  "Your job is to verify that the proposed action matches the user's intent and the available tracks.",
+  "Return strict JSON only with keys say, playTrackId, reason, externalSearchQuery.",
+  "Do not invent a track id that is not in the provided tracks list.",
+  "If the intent is chat_only, clear playTrackId and externalSearchQuery.",
+  "If the intent is recommend_library, keep playback inside the library and clear externalSearchQuery.",
+  "If the intent asks for a search or external recommendation, prefer externalSearchQuery and keep playTrackId null.",
+  "If the assistant says it is playing but no valid local track exists, correct it into a candidate search or a clarification.",
+  "Keep the reply concise, natural, and in Chinese when possible."
+].join("\n");
+
+function reviewAiActionRules(action: AiAction, message: string, context?: AiRequestContext, allowExternal = false): AiAction {
+  const intent = classifyAiIntent(message);
+  const localTrack = action.playTrackId ? getTrack(action.playTrackId) : null;
+  let reviewed: AiAction = {
+    ...action,
+    playTrackId: localTrack ? action.playTrackId ?? null : null,
+    reason: [action.reason, `intent:${intent.kind}:${intent.confidence.toFixed(2)}`].filter(Boolean).join("; ")
+  };
+
+  if (intent.kind === "chat_only") {
+    return intent.confidence < 0.7 ? { ...reviewed, playTrackId: null } : { ...reviewed, playTrackId: null, externalSearchQuery: null };
+  }
+
+  if (intent.kind === "recommend_library") {
+    const playable = reviewed.playTrackId ? getTrack(reviewed.playTrackId) : null;
+    if (playable && (intent.allowInstrumental || !isLikelyInstrumentalCandidate(playable))) {
+      return { ...reviewed, externalSearchQuery: null };
+    }
+    const fallback = pickPreferenceWeightedLocalTrack(listTracks(20), sanitizePreferences(context?.preferences), intent.allowInstrumental);
+    return { ...reviewed, playTrackId: fallback?.id ?? null, externalSearchQuery: null };
+  }
+
+  if (intent.kind === "play_current_candidate") {
+    const assistantRequested = extractSongRequest(action.say);
+    if (allowExternal && assistantRequested.title && !reviewed.playTrackId) {
+      return {
+        ...reviewed,
+        playTrackId: null,
+        externalSearchQuery: biasExternalSearchQuery(
+          reviewed.externalSearchQuery || buildExternalSearchQuery(message, assistantRequested, context),
+          message
+        ),
+        say: reviewed.say.replace(/(现在|马上)?就?给你放起来|正在播放|开始播放/g, "我先把候选找出来")
+      };
+    }
+    return { ...reviewed, playTrackId: null, externalSearchQuery: null };
+  }
+
+  reviewed = ensurePlayableActionForRequest(reviewed, message, context, allowExternal);
+  reviewed = ensureExternalCandidateSearchForRequest(reviewed, message, context, allowExternal);
+
+  if (intent.confidence < 0.7 && reviewed.playTrackId && !intent.shouldAutoplay) {
+    reviewed = { ...reviewed, playTrackId: null };
+  }
+
+  return reviewed;
+}
+
+function buildReviewModelContext(action: AiAction, message: string, context?: AiRequestContext, allowExternal = false) {
+  const preferences = sanitizePreferences(context?.preferences);
+  const tracks = listTracks(18)
+    .map((track, index) => ({
+      id: track.id,
+      title: track.title,
+      artist: track.artist,
+      language: track.language,
+      genre: track.genre,
+      mood: track.mood,
+      scene: track.scene,
+      tempo: track.tempo,
+      source: track.source,
+      preferenceScore: scoreTrackByPreferences(track, preferences),
+      index
+    }))
+    .sort((a, b) => b.preferenceScore - a.preferenceScore || a.index - b.index)
+    .slice(0, 10);
+
+  return {
+    message,
+    allowExternal,
+    intent: classifyAiIntent(message),
+    context,
+    action,
+    tracks
+  };
+}
+
+async function reviewAiActionWithModel(action: AiAction, message: string, context?: AiRequestContext, allowExternal = false): Promise<AiAction> {
+  const deterministic = reviewAiActionRules(action, message, context, allowExternal);
+  if (!config.OPENAI_REVIEW_MODEL || hasOpenAiClientOverrideForTests || !config.OPENAI_API_KEY) return deterministic;
+
+  const model = config.OPENAI_REVIEW_MODEL;
+  const modelContext = buildReviewModelContext(deterministic, message, context, allowExternal);
+
+  try {
+    const timeoutMs = 6_000;
+    const text = await withAbortableTimeout(
+      (requestOptions) =>
+        isClaudeModel(model)
+          ? createClaudeTextCompletion(model, actionReviewPrompt, modelContext, [], 220, requestOptions)
+          : createOpenAiCompatibleTextCompletion(model, actionReviewPrompt, modelContext, [], 220, requestOptions),
+      timeoutMs,
+      "AI action review"
+    );
+    const parsed = aiActionSchema.parse(JSON.parse(text));
+    return reviewAiActionRules(parsed, message, context, allowExternal);
+  } catch {
+    return deterministic;
+  }
+}
+
+function ensurePlayableActionForRequest(action: AiAction, message: string, context?: AiRequestContext, allowExternal = false): AiAction {
+  if (!wantsPlayback(message)) return action;
+
+  const localTrack = action.playTrackId ? getTrack(action.playTrackId) : null;
+  if (localTrack && (wantsInstrumentalRecommendation(message) || !isLikelyInstrumentalCandidate(localTrack))) return action;
+
+  if (!allowExternal) {
+    const fallback = pickPreferenceWeightedLocalTrack(listTracks(20), sanitizePreferences(context?.preferences), wantsInstrumentalRecommendation(message));
+    return { ...action, playTrackId: fallback?.id ?? null };
+  }
+
+  const requested = extractSongRequest(message);
+  const assistantRequested = requested.title ? requested : extractSongRequest(action.say);
+  return {
+    ...action,
+    playTrackId: null,
+    externalSearchQuery: action.externalSearchQuery
+      ? biasExternalSearchQuery(action.externalSearchQuery, message)
+      : buildExternalSearchQuery(message, assistantRequested, context)
+  };
 }
 
 function localFallbackV2(message: string, allowExternal = false, context?: AiRequestContext): AiAction {
+  const intent = classifyAiIntent(message);
   const tracks = listTracks(20);
   const requested = extractSongRequest(message);
   const reqTitle = normalize(requested.title);
@@ -237,8 +534,11 @@ function localFallbackV2(message: string, allowExternal = false, context?: AiReq
       })
       .sort((a, b) => b.score - a.score)[0];
 
-  const shouldUseExternal = allowExternal && wantsExternalRecommendation(message) && !wantsLibraryRecommendation(message);
-  const picked = shouldUseExternal ? null : bestRequested && bestRequested.score >= 95 ? bestRequested.track : tracks[0];
+  const preferences = sanitizePreferences(context?.preferences);
+  const shouldUseExternal =
+    allowExternal && intent.needsExternalSearch && intent.kind !== "recommend_library" && !wantsLibraryRecommendation(message);
+  const preferredTrack = pickPreferenceWeightedLocalTrack(tracks, preferences, wantsInstrumentalRecommendation(message));
+  const picked = shouldUseExternal ? null : bestRequested && bestRequested.score >= 95 ? bestRequested.track : preferredTrack || tracks[0];
   const externalSearchQuery = allowExternal && (shouldUseExternal || requested.title || !picked) ? buildExternalSearchQuery(message, requested, context) : undefined;
 
   return {
@@ -332,6 +632,7 @@ function shouldRefreshMemory(pendingCount: number, lastSummaryAt?: string) {
 }
 
 async function createClaudeTextCompletion(
+  model: string,
   systemPrompt: string,
   context: unknown,
   messages: ChatMessageParam[],
@@ -340,7 +641,7 @@ async function createClaudeTextCompletion(
 ) {
   if (!config.OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
 
-  const response = await rightCodesFetch(resolveClaudeMessagesUrl(), {
+  const response = await rightCodesFetch(resolveClaudeMessagesUrl(model), {
     method: "POST",
     signal: requestOptions.signal,
     headers: {
@@ -349,7 +650,7 @@ async function createClaudeTextCompletion(
       authorization: `Bearer ${config.OPENAI_API_KEY}`
     },
     body: JSON.stringify({
-      model: config.OPENAI_TEXT_MODEL,
+      model,
       max_tokens: maxTokens,
       system: systemPrompt,
       messages: [
@@ -377,57 +678,45 @@ async function createClaudeTextCompletion(
 }
 
 async function createClaudeMessage(context: unknown, messages: ChatMessageParam[], requestOptions: RequestOptions) {
-  return createClaudeTextCompletion(radioSystemPrompt, context, messages, 220, requestOptions);
+  return createClaudeTextCompletion(config.OPENAI_TEXT_MODEL, radioSystemPrompt, context, messages, 220, requestOptions);
 }
 
 async function createClaudeWelcome(context: unknown, requestOptions: RequestOptions) {
-  return createClaudeTextCompletion(welcomePrompt, context, [], 100, requestOptions);
+  return createClaudeTextCompletion(config.OPENAI_TEXT_MODEL, welcomePrompt, context, [], 100, requestOptions);
 }
 
 async function createClaudeMemorySummary(context: unknown, messages: ChatMessageParam[], requestOptions: RequestOptions) {
-  return createClaudeTextCompletion(memorySummaryPrompt, context, messages, 220, requestOptions);
+  return createClaudeTextCompletion(config.OPENAI_TEXT_MODEL, memorySummaryPrompt, context, messages, 220, requestOptions);
 }
 
 async function createOpenAiCompatibleMessage(context: unknown, messages: ChatMessageParam[], requestOptions: RequestOptions) {
-  const response = await client!.chat.completions.create(
-    {
-      model: config.OPENAI_TEXT_MODEL,
-      max_tokens: 220,
-      messages: [
-        { role: "system", content: radioSystemPrompt },
-        { role: "user", content: `Context: ${JSON.stringify(context)}` },
-        ...messages
-      ]
-    } as never,
-    requestOptions as never
-  );
-  return response.choices?.[0]?.message?.content || "{}";
+  return createOpenAiCompatibleTextCompletion(config.OPENAI_TEXT_MODEL, radioSystemPrompt, context, messages, 220, requestOptions);
 }
 
 async function createOpenAiCompatibleWelcome(context: unknown, requestOptions: RequestOptions) {
-  const response = await client!.chat.completions.create(
-    {
-      model: config.OPENAI_TEXT_MODEL,
-      max_tokens: 100,
-      messages: [
-        { role: "system", content: welcomePrompt },
-        { role: "user", content: `Context: ${JSON.stringify(context)}` }
-      ]
-    } as never,
-    requestOptions as never
-  );
-  const text = response.choices?.[0]?.message?.content?.trim();
+  const text = await createOpenAiCompatibleTextCompletion(config.OPENAI_TEXT_MODEL, welcomePrompt, context, [], 100, requestOptions);
   if (!text) throw new Error("OpenAI welcome response is empty");
   return text.replace(/^["\u201c\u201d]|["\u201c\u201d]$/g, "");
 }
 
 async function createOpenAiCompatibleMemorySummary(context: unknown, messages: ChatMessageParam[], requestOptions: RequestOptions) {
+  return createOpenAiCompatibleTextCompletion(config.OPENAI_TEXT_MODEL, memorySummaryPrompt, context, messages, 220, requestOptions);
+}
+
+async function createOpenAiCompatibleTextCompletion(
+  model: string,
+  systemPrompt: string,
+  context: unknown,
+  messages: ChatMessageParam[],
+  maxTokens: number,
+  requestOptions: RequestOptions
+) {
   const response = await client!.chat.completions.create(
     {
-      model: config.OPENAI_TEXT_MODEL,
-      max_tokens: 220,
+      model,
+      max_tokens: maxTokens,
       messages: [
-        { role: "system", content: memorySummaryPrompt },
+        { role: "system", content: systemPrompt },
         { role: "user", content: `Context: ${JSON.stringify(context)}` },
         ...messages
       ]
@@ -435,7 +724,7 @@ async function createOpenAiCompatibleMemorySummary(context: unknown, messages: C
     requestOptions as never
   );
   const text = response.choices?.[0]?.message?.content?.trim();
-  if (!text) throw new Error("OpenAI memory summary response is empty");
+  if (!text) throw new Error("OpenAI response is empty");
   return text;
 }
 
@@ -481,6 +770,7 @@ export async function askAi(
   message: string,
   options?: { timeoutMs?: number; context?: AiRequestContext; allowExternal?: boolean; sessionId?: string }
 ): Promise<AiAction> {
+  const intent = classifyAiIntent(message);
   const sessionId = options?.sessionId?.trim() || "default";
   saveAiMessage(sessionId, "user", message);
   const recentMessages = listRecentAiMessages(sessionId, RECENT_MESSAGE_LIMIT);
@@ -493,10 +783,29 @@ export async function askAi(
     return fallback;
   }
 
+  const preferences = sanitizePreferences(options?.context?.preferences);
+  const tracks = listTracks(50)
+    .map((track, index) => ({ track, index, preferenceScore: scoreTrackByPreferences(track, preferences) }))
+    .sort((a, b) => b.preferenceScore - a.preferenceScore || a.index - b.index)
+    .slice(0, 12)
+    .map(({ track, preferenceScore }) => ({
+      id: track.id,
+      title: track.title,
+      artist: track.artist,
+      language: track.language,
+      genre: track.genre,
+      mood: track.mood,
+      scene: track.scene,
+      tempo: track.tempo,
+      source: track.source,
+      preferenceScore
+    }));
   const context = {
-    tracks: listTracks(12).map((track) => ({ id: track.id, title: track.title, artist: track.artist, source: track.source })),
+    now: formatBeijingNow(),
+    tracks,
+    intent,
     recentConversation: recentMessages.map((entry) => ({ role: entry.role, content: entry.content })),
-    listener: options?.context || {},
+    listener: { ...(options?.context || {}), preferenceHints: topPreferenceTerms(preferences) },
     allowExternal: Boolean(options?.allowExternal)
   };
 
@@ -514,7 +823,7 @@ export async function askAi(
           timeoutMs,
           attempt === 0 ? "OpenAI response" : "Claude response"
         );
-        const parsed = parseAiJson(text);
+        const parsed = await reviewAiActionWithModel(parseAiJson(text), message, options?.context, options?.allowExternal);
         saveAiMessage(sessionId, "assistant", parsed.say);
         void refreshGlobalMemoryFromMessages().catch(() => undefined);
         return parsed;
@@ -538,7 +847,7 @@ export async function createWelcome(
   await ensureAgentsMemoryFile();
   const globalMemory = await readAutoMemory();
   const context = {
-    now: new Date().toISOString(),
+    now: formatBeijingNow(),
     trackCount: options?.trackCount ?? listTracks().length,
     listener: options?.context || {},
     globalMemory

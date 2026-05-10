@@ -1,4 +1,4 @@
-import type { AiAction, AiContext, Playlist, Track, TrackInput } from "./types";
+import type { AiAction, AiContext, PlayableTrack, Playlist, Track, TrackInput } from "./types";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, init);
@@ -11,7 +11,7 @@ export const radioApi = {
   tracks: () => request<{ tracks: Track[] }>("/api/tracks"),
   playlists: () => request<{ playlists: Playlist[] }>("/api/playlists"),
   resolve: (payload: { trackId?: number; track?: TrackInput; quality?: string }) =>
-    request<{ url: string; playbackUrl?: string; cached: boolean; sourceReady: boolean }>("/api/music/resolve", {
+    request<{ url: string; playbackUrl?: string; cached: boolean; sourceReady: boolean; track?: PlayableTrack }>("/api/music/resolve", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ quality: "128k", ...payload })

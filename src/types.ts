@@ -42,6 +42,7 @@ export interface AiContext {
   mood?: string;
   timeSlot?: string;
   currentTrack?: Pick<Track, "id" | "title" | "artist" | "source"> | null;
+  preferences?: Partial<Record<"artist" | "language" | "genre" | "mood" | "scene" | "tempo", Record<string, number>>>;
 }
 
 export interface AiAction {

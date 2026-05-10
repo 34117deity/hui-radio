@@ -10,7 +10,15 @@ import {
   listRecentAiMessages,
   upsertTrack
 } from "../server/db.js";
-import { askAi, aiActionSchema, refreshGlobalMemoryFromMessages, setOpenAiClientForTests, ttsCachePath } from "../server/services/openai.js";
+import {
+  askAi,
+  aiActionSchema,
+  biasExternalSearchQuery,
+  refreshGlobalMemoryFromMessages,
+  setOpenAiClientForTests,
+  ttsCachePath,
+  wantsExternalCandidateSearch
+} from "../server/services/openai.js";
 import { DEFAULT_AUTO_MEMORY, ensureAgentsMemoryFile, readAutoMemory } from "../server/services/memory.js";
 
 beforeEach(async () => {
@@ -63,6 +71,7 @@ describe("AI action schema", () => {
 describe("askAi", () => {
   it("returns parsed JSON from OpenAI chat completions and includes recent conversation context", async () => {
     const capturedBodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+    const playable = upsertTrack({ title: "Playable Song", artist: "Test Artist", source: "test" });
     setOpenAiClientForTests({
       chat: {
         completions: {
@@ -74,7 +83,7 @@ describe("askAi", () => {
                   message: {
                     content: JSON.stringify({
                       say: "这首很适合现在。",
-                      playTrackId: 7,
+                      playTrackId: playable.id,
                       externalSearchQuery: null
                     })
                   }
@@ -96,10 +105,13 @@ describe("askAi", () => {
       context: { city: "深圳", weather: "下雨", mood: "有点累", timeSlot: "晚上" }
     });
 
-    expect(result).toMatchObject({ say: "这首很适合现在。", playTrackId: 7, externalSearchQuery: null });
+    expect(result).toMatchObject({ say: "这首很适合现在。", playTrackId: playable.id, externalSearchQuery: null });
     expect(capturedBodies[0]?.messages.some((entry) => typeof entry.content === "string" && entry.content.includes(`"recentConversation"`))).toBe(
       true
     );
+    expect(capturedBodies[0]?.messages[0]?.content).toContain("原版优先");
+    expect(capturedBodies[0]?.messages[0]?.content).toContain("有人声优先");
+    expect(capturedBodies[0]?.messages[0]?.content).toContain("除非用户明确说要纯音乐");
   });
 
   it("falls back quickly when the OpenAI request hangs", async () => {
@@ -141,7 +153,166 @@ describe("askAi", () => {
 
     expect(result.playTrackId).toBeNull();
     expect(result.externalSearchQuery).toContain("安静");
+    expect(result.externalSearchQuery).toContain("原唱");
+    expect(result.externalSearchQuery).toContain("人声");
     expect(result.say).toContain("曲库外");
+  });
+
+  it("does not add vocal bias when the user explicitly asks for instrumental music", async () => {
+    const result = await askAi("推荐一首纯音乐", {
+      allowExternal: true
+    });
+
+    expect(result.playTrackId).toBeNull();
+    expect(result.externalSearchQuery).toContain("纯音乐");
+    expect(result.externalSearchQuery).not.toContain("人声");
+  });
+
+  it("falls back from an instrumental local pick to an original vocal external search", async () => {
+    const instrumental = upsertTrack({ title: "Quiet Night Instrumental", artist: "Test Artist", source: "test" });
+    setOpenAiClientForTests({
+      chat: {
+        completions: {
+          create: async () => ({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    say: "这首安静的纯音乐很适合现在。",
+                    playTrackId: instrumental.id,
+                    externalSearchQuery: null
+                  })
+                }
+              }
+            ]
+          })
+        }
+      },
+      audio: { speech: { create: async () => new Response() } }
+    });
+
+    const result = await askAi("来一首安静一点的歌", { allowExternal: true });
+
+    expect(result.playTrackId).toBeNull();
+    expect(result.externalSearchQuery).toContain("原唱");
+    expect(result.externalSearchQuery).toContain("人声");
+  });
+
+  it("uses listener preferences when choosing a local fallback track", async () => {
+    const low = upsertTrack({ title: "Low Score", artist: "Plain Artist", source: "test" });
+    const high = upsertTrack({ title: "High Score", artist: "Fav Artist", genre: "dream pop", source: "test" });
+
+    const result = await askAi("推荐曲库里一首", {
+      allowExternal: false,
+      context: { preferences: { artist: { "Fav Artist": 8 }, genre: { "dream pop": 4 } } }
+    });
+
+    expect(result.playTrackId).toBe(high.id);
+    expect(result.playTrackId).not.toBe(low.id);
+  });
+
+  it("uses listener preferences when building external fallback searches", async () => {
+    const result = await askAi("推荐一首我没听过的歌", {
+      allowExternal: true,
+      context: { preferences: { genre: { "dream pop": 9 }, mood: { calm: 4 } } }
+    });
+
+    expect(result.playTrackId).toBeNull();
+    expect(result.externalSearchQuery).toContain("dream pop");
+  });
+
+  it("adds an external search target when AI says it will play but omits a playable id", async () => {
+    setOpenAiClientForTests({
+      chat: {
+        completions: {
+          create: async () => ({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    say: "好的，现在为你播放林忆莲的《至少还有你》。",
+                    playTrackId: null,
+                    externalSearchQuery: null
+                  })
+                }
+              }
+            ]
+          })
+        }
+      },
+      audio: { speech: { create: async () => new Response() } }
+    });
+
+    const result = await askAi("那你倒是播放", { allowExternal: true });
+
+    expect(result.playTrackId).toBeNull();
+    expect(result.externalSearchQuery).toContain("至少还有你");
+  });
+
+  it("forces candidate search and corrects compact English song requests", async () => {
+    setOpenAiClientForTests({
+      chat: {
+        completions: {
+          create: async () => ({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    say: "好的，我先把候选找出来。",
+                    playTrackId: null,
+                    externalSearchQuery: null
+                  })
+                }
+              }
+            ]
+          })
+        }
+      },
+      audio: { speech: { create: async () => new Response() } }
+    });
+
+    const result = await askAi("詹姆斯布朗特的youarebeautiful", { allowExternal: true });
+
+    expect(result.playTrackId).toBeNull();
+    expect(result.externalSearchQuery).toContain("You're Beautiful");
+    expect(result.externalSearchQuery).toContain("James Blunt");
+    expect(result.externalSearchQuery).toContain("原唱");
+    expect(result.externalSearchQuery).toContain("人声");
+  });
+
+  it("restores the requested artist when AI returns an underspecified external query", async () => {
+    setOpenAiClientForTests({
+      chat: {
+        completions: {
+          create: async () => ({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    say: "我先把候选找出来。",
+                    playTrackId: null,
+                    externalSearchQuery: "You Are Beautiful"
+                  })
+                }
+              }
+            ]
+          })
+        }
+      },
+      audio: { speech: { create: async () => new Response() } }
+    });
+
+    const result = await askAi("詹姆斯布朗特的youarebeautiful", { allowExternal: true });
+
+    expect(result.externalSearchQuery).toContain("James Blunt");
+    expect(result.externalSearchQuery).toContain("You're Beautiful");
+  });
+
+  it("detects external candidate search and applies known music aliases", () => {
+    expect(wantsExternalCandidateSearch("詹姆斯布朗特的youarebeautiful")).toBe(true);
+    expect(biasExternalSearchQuery("詹姆斯布朗特 youarebeautiful", "詹姆斯布朗特的youarebeautiful")).toContain(
+      "James Blunt You're Beautiful"
+    );
   });
 
   it("stores and isolates recent messages by session id", async () => {

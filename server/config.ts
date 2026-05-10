@@ -6,12 +6,15 @@ import { z } from "zod";
 dotenv.config();
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const trimmedString = () => z.string().transform((value) => value.trim());
 
 const envSchema = z.object({
+  HOST: trimmedString().default("127.0.0.1"),
   OPENAI_API_KEY: z.string().optional(),
   OPENAI_BASE_URL: z.string().optional(),
   OPENAI_PROXY_URL: z.string().optional(),
   OPENAI_TEXT_MODEL: z.string().default("claude-haiku-4-5"),
+  OPENAI_REVIEW_MODEL: z.string().default("claude-sonnet-4-5-20251001"),
   OPENAI_TTS_MODEL: z.string().default("IndexTeam/IndexTTS-2"),
   OPENAI_TTS_VOICE: z.string().default("IndexTeam/IndexTTS-2:alex"),
   SILICONFLOW_API_KEY: z.string().optional(),
@@ -22,7 +25,9 @@ const envSchema = z.object({
   LX_SOURCE_FETCH_TIMEOUT_MS: z.coerce.number().int().positive().default(15000),
   LX_SOURCE_FETCH_RETRIES: z.coerce.number().int().min(0).max(5).default(2),
   LX_BAD_SOURCE_TTL_MS: z.coerce.number().int().positive().default(300000),
-  PORT: z.coerce.number().default(3000)
+  PORT: z.coerce.number().default(3000),
+  VITE_HOST: trimmedString().default("127.0.0.1"),
+  VITE_PORT: z.coerce.number().default(5173)
 });
 
 export const config = {

@@ -19,6 +19,44 @@ function stripJsonp(text: string): unknown {
   return JSON.parse(trimmed.slice(start + 1, end));
 }
 
+function decodeBase64Text(value: unknown) {
+  if (typeof value !== "string" || !value.trim()) return "";
+  return Buffer.from(value, "base64").toString("utf8").trim();
+}
+
+export async function fetchQqLyric(songmid?: string): Promise<string | null> {
+  if (!songmid) return null;
+  const api = new URL("https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg");
+  api.search = new URLSearchParams({
+    songmid,
+    format: "json",
+    nobase64: "0",
+    g_tk: "5381",
+    loginUin: "0",
+    hostUin: "0",
+    inCharset: "utf8",
+    outCharset: "utf-8",
+    notice: "0",
+    platform: "yqq",
+    needNewCode: "0"
+  }).toString();
+
+  const response = await fetch(api, {
+    signal: AbortSignal.timeout(10_000),
+    headers: {
+      referer: "https://y.qq.com/",
+      origin: "https://y.qq.com",
+      "user-agent": "Mozilla/5.0 HuiMusicRadio/1.0"
+    }
+  });
+  if (!response.ok) throw new Error(`QQ Music lyric failed: ${response.status}`);
+
+  const payload = stripJsonp(await response.text()) as Record<string, unknown>;
+  const lyric = decodeBase64Text(payload.lyric);
+  const translatedLyric = decodeBase64Text(payload.trans);
+  return [lyric, translatedLyric].filter(Boolean).join("\n").trim() || null;
+}
+
 export function mapQqSong(song: Record<string, unknown>): TrackInput | null {
   const title = typeof song.songname === "string" ? song.songname : typeof song.name === "string" ? song.name : undefined;
   if (!title) return null;

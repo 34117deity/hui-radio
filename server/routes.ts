@@ -13,17 +13,32 @@ import {
   listPlaylists,
   listTracks,
   removeTrack,
+  updateTrackLyric,
   upsertPlaylist,
   upsertTrack
 } from "./db.js";
-import { importQqPlaylist, searchQqSongs } from "./importers/qq.js";
+import { fetchQqLyric, importQqPlaylist, searchQqSongs } from "./importers/qq.js";
 import { parseLxImport } from "./importers/lx.js";
-import { askAi, createWelcome, synthesizeSpeech } from "./services/openai.js";
+import {
+  askAi,
+  biasExternalSearchQuery,
+  createWelcome,
+  ensureExternalCandidateSearchForRequest,
+  scoreSongVersionPreference,
+  synthesizeSpeech,
+  wantsInstrumentalRecommendation
+} from "./services/openai.js";
+import { extractSongRequest, normalizeKnownMusicAliases } from "../shared/aiIntent.js";
 import { getLxSourceHealth, loadLxSource, resolveLxMusicUrl } from "./services/lxSource.js";
 import type { Track, TrackInput } from "./types.js";
 
 export const api = express.Router();
 const externalPlaybackCache = new NodeCache({ stdTTL: 60 * 15, checkperiod: 60 });
+const BEIJING_TIME_ZONE = "Asia/Shanghai";
+
+function formatBeijingNow() {
+  return new Date().toLocaleString("zh-CN", { timeZone: BEIJING_TIME_ZONE, hour12: false });
+}
 
 const trackInputSchema = z.object({
   title: z.string().min(1),
@@ -46,6 +61,19 @@ const trackInputSchema = z.object({
   raw: z.unknown().optional(),
   directUrl: z.string().optional()
 });
+const preferenceBucketSchema = z.record(z.string(), z.number());
+const preferencesSchema = z
+  .object({
+    artist: preferenceBucketSchema.optional(),
+    language: preferenceBucketSchema.optional(),
+    genre: preferenceBucketSchema.optional(),
+    mood: preferenceBucketSchema.optional(),
+    scene: preferenceBucketSchema.optional(),
+    tempo: preferenceBucketSchema.optional()
+  })
+  .optional();
+
+type AiPreferences = NonNullable<z.infer<typeof preferencesSchema>>;
 
 function normalizeSongIdentity(value?: string) {
   return (value || "").toLowerCase().replace(/[\u3001\u3002\u300a\u300b\u300c\u300d\u300e\u300f\u201c\u201d\u2018\u2019"'`()[\]\uff08\uff09\s]/g, "");
@@ -59,9 +87,65 @@ function isAlreadyInLibrary(candidate: TrackInput, library: Track[]) {
   return library.some((track) => normalizeSongIdentity(track.title) === title && normalizeSongIdentity(track.artist) === artist);
 }
 
-function filterLibraryCandidates(candidates: TrackInput[]) {
+function scoreCandidateByPreferences(candidate: TrackInput, preferences?: AiPreferences) {
+  if (!preferences) return 0;
+  return (["artist", "language", "genre", "mood", "scene", "tempo"] as const).reduce((score, bucket) => {
+    const value = candidate[bucket];
+    if (!value) return score;
+    return (
+      score +
+      String(value)
+        .split(/[\/,\u3001]+/u)
+        .map((tag) => tag.trim())
+        .filter(Boolean)
+        .reduce((bucketScore, tag) => bucketScore + (preferences[bucket]?.[tag] || 0), 0)
+    );
+  }, 0);
+}
+
+function normalizeKnownSearchAliases(value: string) {
+  return normalizeKnownMusicAliases(value);
+}
+
+function restoreSearchTermsFromMessage(query: string | null | undefined, message: string) {
+  const requested = extractSongRequest(message);
+  const artist = requested.artist || "";
+  const title = requested.title || "";
+  const parts = [query || ""];
+  const normalizedQuery = normalizeSongIdentity(query || "");
+  if (title && !normalizedQuery.includes(normalizeSongIdentity(title))) parts.unshift(title);
+  if (artist && !normalizedQuery.includes(normalizeSongIdentity(artist))) parts.push(artist);
+  return biasExternalSearchQuery(normalizeKnownSearchAliases(parts.filter(Boolean).join(" ")), message);
+}
+
+function filterLibraryCandidates(candidates: TrackInput[], preferences?: AiPreferences, allowInstrumental = false) {
   const library = listTracks(500);
-  return candidates.filter((candidate) => !isAlreadyInLibrary(candidate, library));
+  return candidates
+    .filter((candidate) => !isAlreadyInLibrary(candidate, library))
+    .map((candidate, index) => ({
+      candidate,
+      index,
+      score: scoreCandidateByPreferences(candidate, preferences) + scoreSongVersionPreference(candidate, allowInstrumental)
+    }))
+    .sort((a, b) => b.score - a.score || a.index - b.index)
+    .map((item) => item.candidate);
+}
+
+async function hydrateTrackLyric(track: TrackInput, trackId?: number): Promise<TrackInput> {
+  if (track.lyric?.trim()) return track;
+  const songmid = track.songmid || (track.source === "tx" ? track.sourceId : undefined);
+  if (!songmid) return track;
+
+  try {
+    const lyric = await fetchQqLyric(songmid);
+    if (!lyric) return track;
+    if (trackId) {
+      return updateTrackLyric(trackId, lyric) || { ...track, lyric };
+    }
+    return { ...track, lyric };
+  } catch {
+    return track;
+  }
 }
 
 async function proxyAudio(url: string, req: express.Request, res: express.Response) {
@@ -112,7 +196,7 @@ api.get("/health", async (_req, res) => {
   if (!lx.ready && !lx.activeSource) {
     void loadLxSource().catch(() => undefined);
   }
-  res.json({ ok: true, lx, time: new Date().toISOString() });
+  res.json({ ok: true, lx, time: formatBeijingNow(), timeZone: BEIJING_TIME_ZONE });
 });
 
 api.get("/playlists", (_req, res) => res.json({ playlists: listPlaylists() }));
@@ -191,16 +275,17 @@ api.post("/music/resolve", async (req, res, next) => {
       .parse(req.body);
     const track = body.trackId ? getTrack(body.trackId) : body.track;
     if (!track) throw new Error("Track not found for resolve");
-    const resolved = await resolveLxMusicUrl(track, body.quality);
+    const hydratedTrack = await hydrateTrackLyric(track, body.trackId);
+    const resolved = await resolveLxMusicUrl(hydratedTrack, body.quality);
     let playbackUrl = resolved.url;
     if (body.trackId) {
       playbackUrl = `/api/music/stream?trackId=${body.trackId}&quality=${encodeURIComponent(body.quality)}`;
     } else if (body.track) {
       const token = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-      externalPlaybackCache.set(token, { url: resolved.url, track: body.track, quality: body.quality });
+      externalPlaybackCache.set(token, { url: resolved.url, track: hydratedTrack, quality: body.quality });
       playbackUrl = `/api/music/stream-external/${encodeURIComponent(token)}`;
     }
-    res.json({ ...resolved, playbackUrl });
+    res.json({ ...resolved, playbackUrl, track: hydratedTrack });
   } catch (error) {
     next(error);
   }
@@ -246,6 +331,7 @@ api.post("/ai/chat", async (req, res, next) => {
             weather: z.string().optional(),
             mood: z.string().optional(),
             timeSlot: z.string().optional(),
+            preferences: preferencesSchema,
             currentTrack: z
               .object({ id: z.number(), title: z.string(), artist: z.string().optional(), source: z.string().optional() })
               .nullable()
@@ -255,17 +341,32 @@ api.post("/ai/chat", async (req, res, next) => {
         allowExternal: z.boolean().default(true)
       })
       .parse(req.body);
-    const action = await askAi(body.message, {
+    let action = await askAi(body.message, {
         sessionId: body.sessionId,
       context: body.context,
       allowExternal: body.allowExternal
     });
+    action = ensureExternalCandidateSearchForRequest(action, body.message, body.context, body.allowExternal);
+    if (action.externalSearchQuery) {
+      let externalSearchQuery = restoreSearchTermsFromMessage(action.externalSearchQuery, body.message);
+      if (/詹姆斯[·\s-]*布朗特|布朗特|james\s*blunt/i.test(body.message) && !/james\s*blunt/i.test(externalSearchQuery)) {
+        externalSearchQuery = `${externalSearchQuery} James Blunt`;
+      }
+      if (/you\s*(?:are|'?re)?\s*beautiful/i.test(body.message) && !/you'?re\s*beautiful/i.test(externalSearchQuery)) {
+        externalSearchQuery = `You're Beautiful ${externalSearchQuery}`;
+      }
+      action = { ...action, externalSearchQuery: biasExternalSearchQuery(externalSearchQuery, body.message) };
+    }
 
     let externalCandidates: Awaited<ReturnType<typeof searchQqSongs>> = [];
     let externalSearchError: string | undefined;
     if (body.allowExternal && action.externalSearchQuery) {
       try {
-        externalCandidates = filterLibraryCandidates(await searchQqSongs(action.externalSearchQuery, 8)).slice(0, 4);
+        externalCandidates = filterLibraryCandidates(
+          await searchQqSongs(action.externalSearchQuery, 8),
+          body.context?.preferences,
+          wantsInstrumentalRecommendation(body.message)
+        ).slice(0, 4);
       } catch (error) {
         externalSearchError = error instanceof Error ? error.message : String(error);
       }

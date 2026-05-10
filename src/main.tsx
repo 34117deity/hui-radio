@@ -26,6 +26,7 @@ import {
   X
 } from "lucide-react";
 import { radioApi } from "./api";
+import { classifyAiIntent, isExplicitPlaybackRequest } from "./aiPlayback";
 import { loadPreferences, pickPreferenceWeightedTrack, recordPreferenceEvent, savePreferences } from "./preferences";
 import type { Preferences } from "./preferences";
 import type { AiContext, ChatEntry, PlayableTrack, ReplySegment, Track, TrackInput } from "./types";
@@ -46,16 +47,28 @@ type PlayTrackOptions = {
   source?: string;
 };
 
+type LyricLine = {
+  id: string;
+  text: string;
+  time: number;
+};
+
+type TimedLyricLine = LyricLine & {
+  endTime: number;
+};
+
+const BEIJING_TIME_ZONE = "Asia/Shanghai";
+
 function isSavedTrack(track: PlayableTrack | null): track is Track {
   return Boolean(track && typeof (track as Track).id === "number" && (track as Track).id > 0);
 }
 
 function formatClock(date: Date) {
-  return date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false }).replace(":", " : ");
+  return date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false, timeZone: BEIJING_TIME_ZONE }).replace(":", " : ");
 }
 
 function formatDate(date: Date) {
-  return date.toLocaleDateString("en-US", { weekday: "long", month: "short", day: "2-digit", year: "numeric" });
+  return date.toLocaleDateString("en-US", { weekday: "long", month: "short", day: "2-digit", year: "numeric", timeZone: BEIJING_TIME_ZONE });
 }
 
 function formatDuration(value: number) {
@@ -72,7 +85,7 @@ function makeChatId() {
 }
 
 function nowLabel() {
-  return new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
+  return new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false, timeZone: BEIJING_TIME_ZONE });
 }
 
 function normalizeText(value: string) {
@@ -89,6 +102,66 @@ function asErrorMessage(error: unknown) {
 
 function delay(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function parseTimestamp(label: string) {
+  const match = label.match(/(?:(\d{1,2}):)?(\d{1,2}):(\d{1,2})(?:[.:](\d{1,3}))?/);
+  if (!match) return null;
+  const hours = Number(match[1] || 0);
+  const minutes = Number(match[2] || 0);
+  const seconds = Number(match[3] || 0);
+  const fraction = match[4] ? Number(`0.${match[4].padEnd(3, "0").slice(0, 3)}`) : 0;
+  return hours * 3600 + minutes * 60 + seconds + fraction;
+}
+
+function parseLyrics(raw: string | undefined, totalDuration: number): LyricLine[] {
+  const clean = raw?.trim();
+  if (!clean) return [];
+
+  const timedLines: LyricLine[] = [];
+  const plainLines: string[] = [];
+
+  clean.split(/\r?\n/).forEach((line, lineIndex) => {
+    const timestamps = [...line.matchAll(/\[(\d{1,2}:)?\d{1,2}:\d{1,2}(?:[.:]\d{1,3})?\]/g)];
+    const text = line.replace(/\[[^\]]+\]/g, "").trim();
+    if (!text) return;
+
+    if (timestamps.length) {
+      timestamps.forEach((item, timestampIndex) => {
+        const time = parseTimestamp(item[0].slice(1, -1));
+        if (time !== null) timedLines.push({ id: `${lineIndex}-${timestampIndex}`, text, time });
+      });
+      return;
+    }
+
+    plainLines.push(text);
+  });
+
+  if (timedLines.length) {
+    return timedLines.sort((a, b) => a.time - b.time);
+  }
+
+  const safeDuration = totalDuration > 0 ? totalDuration : Math.max(plainLines.length * 8, 1);
+  return plainLines.map((text, index) => ({
+    id: `plain-${index}`,
+    text,
+    time: plainLines.length > 1 ? (safeDuration * index) / plainLines.length : 0
+  }));
+}
+
+function getTimedLyrics(lines: LyricLine[], totalDuration: number): TimedLyricLine[] {
+  return lines.map((line, index) => {
+    const nextLine = lines[index + 1];
+    const fallbackEnd = totalDuration > line.time ? totalDuration : line.time + Math.max(line.text.length * 0.28, 2);
+    return {
+      ...line,
+      endTime: nextLine ? nextLine.time : fallbackEnd
+    };
+  });
+}
+
+function clamp(value: number, min = 0, max = 1) {
+  return Math.min(max, Math.max(min, value));
 }
 
 function extractRequestSafe(input: string) {
@@ -221,9 +294,11 @@ function App() {
   const [clock, setClock] = useState(new Date());
   const [logs, setLogs] = useState<UiLog[]>([]);
   const [logOpen, setLogOpen] = useState(false);
+  const [isSongFocused, setIsSongFocused] = useState(false);
 
   const audioRef = useRef<HTMLAudioElement>(null);
   const voiceAudioRef = useRef<HTMLAudioElement>(null);
+  const focusLyricRefs = useRef(new Map<string, HTMLParagraphElement>());
   const playbackTokenRef = useRef(0);
 
   const currentTitle = current?.title || "No song selected";
@@ -231,6 +306,11 @@ function App() {
   const currentSavedTrackId = isSavedTrack(current) ? current.id : null;
   const currentIsFavorited = currentSavedTrackId !== null && favorites.has(currentSavedTrackId);
   const currentMotionKey = `${currentTitle}-${currentArtist}-${currentSavedTrackId || "external"}`;
+  const focusLyrics = useMemo(() => getTimedLyrics(parseLyrics(current?.lyric, duration), duration), [current?.lyric, duration]);
+  const currentLyricIndex = useMemo(
+    () => focusLyrics.findIndex((line) => currentTime >= line.time && currentTime < line.endTime),
+    [currentTime, focusLyrics]
+  );
 
   const aiContext: AiContext = useMemo(
     () => ({
@@ -240,9 +320,10 @@ function App() {
       timeSlot: timeSlot.trim() || undefined,
       currentTrack: isSavedTrack(current)
         ? { id: current.id, title: current.title, artist: current.artist, source: current.source }
-        : null
+        : null,
+      preferences
     }),
-    [city, current, mood, timeSlot, weather]
+    [city, current, mood, preferences, timeSlot, weather]
   );
 
   const pushStatus = (next: string, level: UiLogLevel = "info", scope = "system") => {
@@ -337,6 +418,22 @@ function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [backendOpen]);
 
+  useEffect(() => {
+    if (!isSongFocused) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setIsSongFocused(false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [isSongFocused]);
+
+  useEffect(() => {
+    if (!isSongFocused || currentLyricIndex < 0) return;
+    const currentLine = focusLyrics[currentLyricIndex];
+    const node = focusLyricRefs.current.get(currentLine.id);
+    node?.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, [currentLyricIndex, focusLyrics, isSongFocused]);
+
   const resolvePlayable = async (track: PlayableTrack) => {
     if (isSavedTrack(track)) return radioApi.resolve({ trackId: track.id });
     return radioApi.resolve({ track });
@@ -384,6 +481,12 @@ function App() {
       }
     }
     if (token !== playbackTokenRef.current) return;
+    if (data.track) {
+      targetTrack = data.track;
+      if (isSavedTrack(data.track)) {
+        setTracks((prev) => prev.map((item) => (item.id === data.track!.id ? data.track as Track : item)));
+      }
+    }
     const isRepeatPlayback = isSavedTrack(targetTrack) && currentSavedTrackId === targetTrack.id && options?.source !== "auto";
 
     const nextUrl = cacheBustPlaybackUrl(data.playbackUrl || data.url);
@@ -527,7 +630,14 @@ function App() {
     pushStatus("Hui Radio is thinking", "info", "ai");
 
     const data = await radioApi.askAi(text, aiContext, true);
-    const assistantText = data.externalSearchError ? `${data.action.say}\n（外部搜索失败：${data.externalSearchError}）` : data.action.say;
+    const intent = classifyAiIntent(text);
+    const explicitPlayback = isExplicitPlaybackRequest(text);
+    const topCandidate = data.externalCandidates[0];
+    const stableCandidateSay =
+      explicitPlayback && topCandidate
+        ? `我先把 ${topCandidate.title}${topCandidate.artist ? ` - ${topCandidate.artist}` : ""} 的候选找出来，并切到最匹配的版本。`
+        : data.action.say;
+    const assistantText = data.externalSearchError ? `${stableCandidateSay}\n（外部搜索失败：${data.externalSearchError}）` : stableCandidateSay;
     setChat((prev) => [
       ...prev,
       {
@@ -546,7 +656,25 @@ function App() {
       pushStatus("Hui Radio replied", "info", "ai");
     }
 
-    speakText(data.action.say).catch((error) => reportError("tts", error));
+    if (explicitPlayback) {
+      const localTrack = data.action.playTrackId ? tracks.find((track) => track.id === data.action.playTrackId) : undefined;
+      const recentCandidate = [...chat].reverse().find((entry) => entry.candidates?.length)?.candidates?.[0];
+      const shouldUseRecentCandidate = intent.kind === "play_current_candidate";
+      let target = localTrack || (shouldUseRecentCandidate ? recentCandidate : undefined) || data.externalCandidates[0];
+      if (!target && data.action.externalSearchQuery) {
+        const fallback = await radioApi.searchMusic(data.action.externalSearchQuery, 4);
+        target = fallback.tracks[0];
+      }
+      if (target) {
+        await playTrack(target, { persist: false, source: "ai" });
+      } else if (data.externalCandidates.length || data.action.externalSearchQuery) {
+        pushStatus("Hui Radio found candidates. Pick the version you want to play.", "info", "ai");
+      } else {
+        pushStatus("Hui Radio could not find a playable song for that request", "warn", "ai");
+      }
+    }
+
+    speakText(stableCandidateSay).catch((error) => reportError("tts", error));
   };
 
   const importQq = async () => {
@@ -585,7 +713,7 @@ function App() {
   };
 
   return (
-    <main className={`radio-page ${theme} ${collapsed ? "is-collapsed" : ""} ${backendOpen ? "backend-is-open" : ""}`}>
+    <main className={`radio-page ${theme} ${collapsed ? "is-collapsed" : ""} ${backendOpen ? "backend-is-open" : ""} ${isSongFocused ? "song-is-focused" : ""}`}>
       <section className="radio-shell">
         <header className="radio-topbar">
           <div className="brand-lockup">
@@ -621,7 +749,14 @@ function App() {
         </section>
 
         <section className="transport-panel">
-          <div className="now-playing" key={currentMotionKey}>
+          <button
+            type="button"
+            className="now-playing"
+            key={currentMotionKey}
+            onClick={() => setIsSongFocused(true)}
+            aria-expanded={isSongFocused}
+            aria-label="Show song details"
+          >
             <div className={`mini-bars ${isPlaying ? "is-playing" : ""}`}>
               {waveBars.slice(0, 5).map((height, index) => <i key={index} style={{ height: `${height * 0.42}px`, animationDelay: `${index * 68}ms` }} />)}
             </div>
@@ -629,7 +764,7 @@ function App() {
               <strong>{currentTitle}</strong>
               <span>{currentArtist}</span>
             </div>
-          </div>
+          </button>
           <div className="transport-buttons">
             <div className="primary-controls">
               <button type="button" onClick={() => previousTrack().catch((error) => reportError("player", error))} title="Previous"><SkipBack size={16} /></button>
@@ -869,6 +1004,77 @@ function App() {
               <textarea id="lx-json" value={lxPayload} onChange={(event) => setLxPayload(event.target.value)} placeholder="Paste LX JSON data here" />
             </div>
           </aside>
+        </div>
+      )}
+
+      {isSongFocused && (
+        <div className="song-focus-backdrop" role="presentation" onClick={() => setIsSongFocused(false)}>
+          <section
+            className="song-focus-view"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Song lyrics"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="song-focus-head">
+              <div>
+                <span>NOW PLAYING</span>
+                <h1>{currentTitle}</h1>
+                <p>{currentArtist}</p>
+              </div>
+              <button
+                type="button"
+                className="focus-close-button"
+                onClick={() => setIsSongFocused(false)}
+                aria-label="Close song details"
+              >
+                <X size={20} />
+              </button>
+            </div>
+
+            <div className="focus-lyric-list" aria-label="Lyrics">
+              {focusLyrics.length > 0 ? (
+                focusLyrics.map((line, index) => {
+                  const isPlayed = currentTime >= line.time;
+                  const isCurrent = index === currentLyricIndex;
+                  const lineDuration = Math.max(line.endTime - line.time, 0.4);
+                  const lineProgress = isPlayed ? clamp((currentTime - line.time) / lineDuration) : 0;
+                  const characters = Array.from(line.text);
+                  const playedCharacters = isCurrent ? Math.floor(lineProgress * characters.length) : isPlayed ? characters.length : 0;
+                  return (
+                    <p
+                      className={`focus-lyric-line ${isPlayed ? "is-played" : "is-pending"} ${isCurrent ? "is-current" : ""}`}
+                      key={line.id}
+                      ref={(node) => {
+                        if (node) focusLyricRefs.current.set(line.id, node);
+                        else focusLyricRefs.current.delete(line.id);
+                      }}
+                    >
+                      {characters.map((character, characterIndex) => (
+                        <span
+                          className={characterIndex < playedCharacters ? "lyric-character is-lit" : "lyric-character"}
+                          key={`${line.id}-${characterIndex}`}
+                        >
+                          {character}
+                        </span>
+                      ))}
+                    </p>
+                  );
+                })
+              ) : (
+                <p className="focus-lyric-empty">No lyrics available for this track yet.</p>
+              )}
+            </div>
+
+            <div className="focus-progress">
+              <span>{formatDuration(currentTime)}</span>
+              <div
+                className="focus-progress-track"
+                style={{ "--focus-progress": `${duration ? (Math.min(currentTime, duration) / duration) * 100 : 0}%` } as React.CSSProperties}
+              />
+              <span>{formatDuration(duration)}</span>
+            </div>
+          </section>
         </div>
       )}
 

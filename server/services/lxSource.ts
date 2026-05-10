@@ -97,9 +97,9 @@ function markSourceSuccess(sourceRef: string) {
   delete perSourceErrors[sourceRef];
 }
 
-async function readRemoteWithRetries(sourceRef: string): Promise<string> {
+async function readRemoteWithRetries(sourceRef: string, retries = config.LX_SOURCE_FETCH_RETRIES): Promise<string> {
   let lastError: unknown;
-  const totalAttempts = config.LX_SOURCE_FETCH_RETRIES + 1;
+  const totalAttempts = retries + 1;
   for (let attempt = 1; attempt <= totalAttempts; attempt += 1) {
     const startedAt = Date.now();
     try {
@@ -130,12 +130,12 @@ async function readRemoteWithRetries(sourceRef: string): Promise<string> {
   throw lastError instanceof Error ? lastError : new Error(String(lastError || "Unknown remote fetch failure"));
 }
 
-async function readSourceScript(sourceRef: string): Promise<string> {
+async function readSourceScript(sourceRef: string, options?: { retries?: number }): Promise<string> {
   if (!/^https?:\/\//i.test(sourceRef)) {
     const sourcePath = sourceRef.startsWith("file://") ? fileURLToPath(sourceRef) : sourceRef;
     return fs.readFile(sourcePath, "utf8");
   }
-  return readRemoteWithRetries(sourceRef);
+  return readRemoteWithRetries(sourceRef, options?.retries);
 }
 
 async function readSnapshotScript() {
@@ -196,9 +196,11 @@ async function fetchSourceScript(): Promise<string> {
   }
 
   const errors: string[] = [];
-  for (const sourceRef of sourceCandidates()) {
+  const candidates = sourceCandidates();
+  for (const [index, sourceRef] of candidates.entries()) {
     try {
-      const script = await readSourceScript(sourceRef);
+      const retries = index === 0 ? 0 : config.LX_SOURCE_FETCH_RETRIES;
+      const script = await readSourceScript(sourceRef, { retries });
       activeSourceRef = sourceRef;
       markSourceSuccess(sourceRef);
       await fs.writeFile(snapshotPath, script, "utf8").catch(() => undefined);

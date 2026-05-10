@@ -229,6 +229,11 @@ export function upsertTrack(input: TrackInput): Track {
   return getTrack(track.id) || track;
 }
 
+export function updateTrackLyric(trackId: number, lyric: string): Track | null {
+  db.prepare("UPDATE tracks SET lyric = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(lyric, trackId);
+  return getTrack(trackId) || null;
+}
+
 export function attachTrackToPlaylist(playlistId: number, trackId: number, position: number) {
   db.prepare("INSERT OR IGNORE INTO playlist_tracks (playlist_id, track_id, position) VALUES (?, ?, ?)").run(
     playlistId,

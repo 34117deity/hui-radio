@@ -5,9 +5,10 @@
     "main":  "server/index.ts",
     "scripts":  {
                     "dev":  "tsx server/index.ts",
-                    "dev:client":  "vite --host 127.0.0.1",
+                    "dev:client":  "vite",
                     "build":  "vite build \u0026\u0026 tsc -p tsconfig.server.json --noEmit",
-                    "preview":  "vite preview --host 127.0.0.1",
+                    "preview":  "vite preview",
+                    "public:share":  "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-public-share.ps1",
                     "test":  "vitest run",
                     "guardian:start":  "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-guardian.ps1",
                     "guardian:stop":  "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stop-guardian.ps1",
